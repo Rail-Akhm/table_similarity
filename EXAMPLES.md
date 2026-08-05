@@ -7,7 +7,7 @@
 
 ## 0. Подготовка
 
-Скопируйте `config.example.yaml` → `config.yaml` и укажите подключение и таблицы:
+Скопируйте `config.example.yaml` → `config/config.yaml` и укажите подключение и таблицы:
 
 ```yaml
 dsn: "postgresql://user:password@host:5432/mydb"
@@ -30,13 +30,13 @@ fuzzy:
 
 ```bash
 # Просканировать все таблицы из конфига
-tablefp index --config config.yaml
+tablefp index --config config/config.yaml
 
 # Переиндексировать всё (данные обновились)
-tablefp index --config config.yaml --force
+tablefp index --config config/config.yaml --force
 
 # Только часть таблиц (перекрывает конфиг) + подробный лог
-tablefp index --config config.yaml --tables "dwh.orders" --tables "stage.*" -v
+tablefp index --config config/config.yaml --tables "dwh.orders" --tables "stage.*" -v
 ```
 
 **Результат:** каталог `./fp_index` (sqlite + `.npy`; при включённом fuzzy —
@@ -48,7 +48,7 @@ tablefp index --config config.yaml --tables "dwh.orders" --tables "stage.*" -v
 
 ```bash
 # Топ-10 + сохранение в JSON (нужен для HTML-отчёта, см. п. 4)
-tablefp search fields.xlsx --config config.yaml --top 10 --fuzzy --out results.json
+tablefp search fields.xlsx --config config/config.yaml --top 10 --fuzzy --out results.json
 ```
 
 В консоль — оценка таблицы, соответствие колонок (1:1, использованное в
@@ -73,10 +73,10 @@ tablefp search fields.xlsx --config config.yaml --top 10 --fuzzy --out results.j
 
 ```bash
 # Одна таблица
-tablefp compare fields.xlsx --config config.yaml --table dwh.orders --fuzzy -o compare.html
+tablefp compare fields.xlsx --config config/config.yaml --table dwh.orders --fuzzy -o compare.html
 
 # Только совпавшие колонки, больше строк, только совпавшие строки
-tablefp compare fields.xlsx --config config.yaml --table dwh.orders \
+tablefp compare fields.xlsx --config config/config.yaml --table dwh.orders \
     --columns matched --limit 1000 --only-matched --fuzzy -o compare.html
 ```
 
@@ -87,7 +87,7 @@ tablefp compare fields.xlsx --config config.yaml --table dwh.orders \
 
 ```bash
 # В compare_reports/: schema.table.html для каждой + index.html со списком и ссылками
-tablefp compare fields.xlsx --config config.yaml --top 10 --fuzzy -o compare_reports/
+tablefp compare fields.xlsx --config config/config.yaml --top 10 --fuzzy -o compare_reports/
 ```
 
 `index.html` — список таблиц с оценкой, процентом верификации и числом
@@ -119,12 +119,12 @@ tablefp report results/*.json -o merged.html
 
 ```bash
 # 1. Разово сканируем таблицы
-tablefp index --config config.yaml
+tablefp index --config config/config.yaml
 
 # 2. Ищем похожие на шаблон, JSON + HTML-отчёт поиска
-tablefp search fields.xlsx --config config.yaml --top 10 --fuzzy --out results.json
+tablefp search fields.xlsx --config config/config.yaml --top 10 --fuzzy --out results.json
 tablefp report results.json -o report.html
 
 # 3. Детально сравниваем топ-10 таблиц одним заходом
-tablefp compare fields.xlsx --config config.yaml --top 10 --fuzzy -o compare_reports/
+tablefp compare fields.xlsx --config config/config.yaml --top 10 --fuzzy -o compare_reports/
 ```
