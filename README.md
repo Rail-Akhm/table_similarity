@@ -1,260 +1,314 @@
-# tablefp — Fuzzy search of DB tables by xlsx template
+# 🔍 tablefp — поиск таблиц по xlsx-шаблону
 
-Given a small template table (xlsx), find which Greenplum tables contain similar data.
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://python.org)
+[![Greenplum](https://img.shields.io/badge/Greenplum-6.24-green)](https://greenplum.org)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Supports **exact containment matching** (Phase 1) and **n-gram fuzzy matching**
-(Phase 2) to tolerate typos and small edits in text columns.
+Дано: небольшой xlsx-шаблон (10–100 строк). Задача: найти, в каких таблицах
+Greenplum содержатся похожие данные.
 
-## Examples
+Два режима сопоставления:
 
-Пошаговые примеры на русском (сканирование → поиск → сравнение → отчёты)
-см. в [EXAMPLES.md](EXAMPLES.md).
+| Фаза | Метод | Устойчивость |
+|------|-------|-------------|
+| **Phase 1** — exact | 64-битные MD5-хэши значений | Только точные совпадения |
+| **Phase 2** — fuzzy | N-граммное (триграммное) сравнение | Опечатки, мелкие правки, подстроки |
 
-## Quick start
+## 🚀 Быстрый старт
 
 ```bash
-# Without pip install
-python run_tablefp.py index --config config.yaml
-python run_tablefp.py search fields.xlsx --config config.yaml --top 5
+# Клонируем
+git clone https://github.com/Rail-Akhm/table_similarity.git
+cd table_similarity
 
-# Or install as package
+# Конфигурируем
+cp config.example.yaml config/config.yaml
+# Редактируем config/config.yaml — указываем DSN и паттерны таблиц
+
+# Индексируем
+python run_tablefp.py index --config config/config.yaml
+
+# Ищем
+python run_tablefp.py search шаблон.xlsx --config config/config.yaml --top 10 --fuzzy
+```
+
+Или через pip:
+
+```bash
 pip install -e .
-tablefp index --config config.yaml
-tablefp search fields.xlsx --config config.yaml --top 5
+tablefp index --config config/config.yaml
+tablefp search шаблон.xlsx --config config/config.yaml --top 10 --fuzzy
 ```
 
-## Commands
+## 📋 Команды
 
-### `index` — Build column fingerprints
+### `index` — индексация таблиц
+
+Строит отпечатки колонок (хэши + статистика) для таблиц из конфига. Запускается
+один раз, затем — только при появлении новых таблиц или обновлении данных.
 
 ```bash
-tablefp index --config config.yaml          # index all configured tables
-tablefp index --config config.yaml --force  # re-index already indexed columns
-tablefp index --config config.yaml -v       # verbose (show every column)
+tablefp index --config config/config.yaml           # все таблицы из конфига
+tablefp index --config config/config.yaml --force   # переиндексировать всё
+tablefp index --config config/config.yaml -v         # подробный лог
+tablefp index --config config/config.yaml --tables "dwh.orders" --tables "stage.*"
 ```
 
-For each column: computes stats (n, unique, min/max, quantiles, avg_len),
-streams sorted int64 hashes → `.npy` (or DB BYTEA). When fuzzy is enabled,
-also builds n-gram hash union for eligible text columns → `.ngrams.npy`.
+**Что делает для каждой колонки:**
 
-### `search` — Find matching tables
+1. Считает статистику: `n`, `nd` (уникальных), min/max/квантили (числа) или avg_len (текст)
+2. Стримит `SELECT DISTINCT h64` → сортированный массив → `.npy`
+3. Если включён fuzzy и колонка текстовая: строит n-граммные хэши → `.ngrams.npy`
+4. Пишет метаданные в `catalog.db` (SQLite)
+
+**Результат:** каталог `fp_index/` с `.npy`-файлами и `catalog.db`.
+
+| Флаг | Описание |
+|------|----------|
+| `--force` | Переиндексировать уже обработанные колонки |
+| `--tables PAT` | Ограничить паттернами (можно несколько раз) |
+| `-v`, `--verbose` | Подробный лог: каждая колонка, время, ошибки |
+
+---
+
+### `search` — поиск совпадений
+
+Ищет таблицы, похожие на xlsx-шаблон, среди всех проиндексированных.
 
 ```bash
-tablefp search fields.xlsx --config config.yaml --top 5
-tablefp search fields.xlsx --config config.yaml --top 5 --out results.json
-tablefp search fields.xlsx --config config.yaml --no-verify  # skip row check
-tablefp search fields.xlsx --config config.yaml --fuzzy       # force fuzzy on
+tablefp search шаблон.xlsx --config config/config.yaml --top 10 --fuzzy
+tablefp search шаблон.xlsx --config config/config.yaml --top 5 --out results.json
+tablefp search шаблон.xlsx --config config/config.yaml --no-verify
+tablefp search шаблон.xlsx --config config/config.yaml --fuzzy --no-fuzzy  # принудительно вкл/выкл
 ```
 
-| Option | Description |
-|---|---|
-| `--top N` | Show top N results (default: 5) |
-| `--no-verify` | Skip stage-3 row verification |
-| `--no-header` | Template has no header row |
-| `--sheet NAME` | Use specific sheet (default: first) |
-| `--out FILE` | Write results to JSON |
-| `--fuzzy` / `--no-fuzzy` | Enable/disable fuzzy matching (default: from config) |
-| `-v`, `--verbose` | Debug-level logging |
+| Флаг | Описание |
+|------|----------|
+| `--top N` | Показать N лучших результатов (по умолчанию: 5) |
+| `--no-verify` | Пропустить построчную верификацию (быстрее) |
+| `--no-header` | В шаблоне нет строки заголовка |
+| `--sheet NAME` | Имя листа (по умолчанию: первый) |
+| `--out FILE` | Сохранить результаты в JSON |
+| `--fuzzy` / `--no-fuzzy` | Вкл/выкл нечёткое сравнение (по умолчанию: из конфига) |
+| `--min-distinct N` | Переопределить порог уникальных значений |
+| `-v`, `--verbose` | Подробный лог |
 
-Besides the 1:1 assigned column mapping (used for scoring), each result also
-lists **all matches** — every DB column whose exact **or** fuzzy containment is
-above `candidate_min_containment` for a given template column. This exposes
-cases the Hungarian assignment hides (e.g. a template column that legitimately
-matches several DB columns). In the JSON and HTML report each candidate is
-tagged `exact` (green) or `fuzzy` (orange) and shows both `exact` and `fuzzy`
-containment percentages.
+**Формат вывода:**
 
-`candidate_min_containment` (default = `min_containment`) sets the bar for this
-list only, without affecting the score. To surface weak **fuzzy** matches — e.g.
-a deposit name that appears only as a *substring* of a long free-text column —
-set `fuzzy.enabled: true` and lower `candidate_min_containment` (e.g. `0.09`).
-The assigned/scored match is unchanged; the weak match just becomes visible as
-an extra `fuzzy` candidate.
+```
+ 1. dwh.orders
+    Score: 0.8523
+    Verified rows: 92.5%
+    Column mapping:
+      name     → full_name       containment=92.3%  unique=512 340
+      city     → region          containment=61.4%  unique=1 205
+    All matches (exact/fuzzy):
+      [exact] name → full_name   exact=92.3%  fuzzy=95.1%  unique=512 340
+      [fuzzy] city → region      exact=12.0%  fuzzy=61.4%  unique=1 205
+```
 
-**Fuzzy metric** (`fuzzy.metric`): how column-level trigram similarity is scored.
-- `jaccard` (default): `|A∩B| / |A∪B|`. Symmetric; a huge free-text column ranks
-  low even if it shares many trigrams (anti-"sponge").
-- `coverage_weighted`: `|A∩B|² / (|A|·|A∪B|)`. Rewards the *number* of template
-  trigrams hit, so a column with many hits (e.g. a long `division` column that
-  embeds deposit names as substrings) ranks **above** incidental trigram noise
-  like unrelated accounting terms — while a genuine same-size match still wins.
-  Choose this if you want high-hit columns prioritized over small-but-noisy ones.
+Для каждой таблицы показывается:
+- **mapping** — 1:1 назначенные пары колонок (используются в scoring)
+- **candidates** — все пары выше порога, включая те, что Hungarian-алгоритм не выбрал
 
-### `report` — Generate HTML report
+---
+
+### `compare` — построчное сравнение
+
+Показывает строки таблицы БД рядом со строками шаблона. Совпадения подсвечены:
+- 🟢 **зелёным** — точное совпадение (нормализованные значения равны)
+- 🟠 **оранжевым** — нечёткое совпадение (общие триграммы выделены в тексте)
+
+```bash
+# Одна таблица
+tablefp compare шаблон.xlsx --config config/config.yaml \
+    --table dwh.orders --fuzzy -o compare.html
+
+# Топ-10 таблиц — отчёты сравнения для каждой + index.html
+tablefp compare шаблон.xlsx --config config/config.yaml \
+    --top 10 --fuzzy -o compare_reports/
+```
+
+| Флаг | Описание |
+|------|----------|
+| `--table SCHEMA.TABLE` | Конкретная таблица (single-table mode) |
+| `--top N` | Топ-N таблиц по score (batch mode) |
+| `--limit N` | Макс. строк для сравнения (0 = без ограничений) |
+| `--columns all\|matched` | Все колонки или только совпавшие |
+| `--only-matched` | Только строки с хотя бы одним совпадением |
+| `--only-hit-cols` / `--no-only-hit-cols` | Скрыть колонки без реальных совпадений |
+| `--all-template-cols` / `--no-all-template-cols` | Показать все колонки шаблона |
+| `--no-verify` | Пропустить верификацию строк |
+| `--sheet NAME` | Имя листа шаблона |
+
+---
+
+### `report` — HTML-отчёт поиска
+
+Превращает JSON из `search --out` в самодостаточный HTML с сортировкой,
+фильтром и полосами оценок.
 
 ```bash
 tablefp report results.json -o report.html
-tablefp report run1.json run2.json -o merged.html
+tablefp report run1.json run2.json -o merged.html   # объединить несколько запусков
+tablefp report results/*.json -o merged.html         # glob-паттерны
 ```
 
-Self-contained HTML file with sortable columns, score bars, column mapping pairs,
-search/filter. No dependencies.
+---
 
-### `compare` — Side-by-side row comparison
+### `run` — полный цикл одной командой
 
 ```bash
-tablefp compare fields.xlsx --config config.yaml --table dwh.orders -o compare.html
-tablefp compare fields.xlsx --config config.yaml --table dwh.orders --columns matched
-tablefp compare fields.xlsx --config config.yaml --table dwh.orders --limit 1000
-tablefp compare fields.xlsx --config config.yaml --table dwh.orders --no-verify
+tablefp run шаблон.xlsx --config config/config.yaml --top 10 --fuzzy -o run_reports/
 ```
 
-Batch mode: `--top N` matches all indexed tables, sorts by score desc, and
-writes one compare report per top-N table plus an `index.html` into the output
-directory:
+Выполняет всё сразу: search → search.json → report.html → compare-отчёты для топ-N таблиц → index.html.
 
-```bash
-tablefp compare fields.xlsx --config config.yaml --top 10 -o compare_reports/
-```
-
-Produces a self-contained, source-driven HTML: the **matching template row is
-shown on the left**, and the **source (DB) table rows are shown on the right**,
-aligned via the best-matched *anchor* column. Matched cells are highlighted on
-both sides:
-
-- **Exact** matches (normalized values equal) are highlighted green.
-- **Fuzzy** matches (text columns, when `--fuzzy`) highlight the shared trigram
-  character spans in orange.
-- Every source row is shown (use `--limit N` to cap); rows with no
-  template match are dimmed and tagged `no match`.
-
-**All** matched columns are shown, not just the single assigned pair — every DB
-column whose exact or fuzzy containment is above `min_containment` is tinted and
-highlighted (e.g. a template column that matches both `mestorozhdenie` and
-`mestorozhdenie_kp` shows both). Rows are aligned on the single best *anchor*.
-
-`--columns` controls width:
-
-- `all` (default) — show every column of both tables; matched columns are tinted
-  in the header, unmatched columns are shown for context without highlighting.
-- `matched` — show only the matched columns (all of them, across candidates).
-
-`--only-hit-cols` hides every column (on both sides) that produced no cell-level
-match — useful when you only care about columns with actual data hits. Enabled
-by default; disable with `--no-only-hit-cols`. Works in both single-table
-(`--table`) and batch (`--top`) modes.
-
-Displayed text is the raw value as stored; matching/highlighting is computed on
-the normalized form. Requires live DB access (raw values are not indexed).
-
-### `run` — Search + search report + compare reports in one command
-
-```bash
-tablefp run fields.xlsx --config config.yaml --top 10 -o run_reports/
-```
-
-Runs the full flow: matches every indexed table against the template, writes
-`search.json` + `report.html`, then generates a compare report for each top-N
-table plus an `index.html` into the output directory. Accepts the same options
-as `search`/`compare` (`--limit`, `--columns`, `--only-matched`,
-`--only-hit-cols/--no-only-hit-cols`, `--all-template-cols`, `--fuzzy`, ...);
-row verification runs once, during the search stage.
-
-## Configuration (`config.yaml`)
+## ⚙️ Конфигурация
 
 ```yaml
-# ── Connection ──
+# ── Подключение ──────────────────────────────────────────────────────────
 dsn: "postgresql://user:password@host:5432/dbname"
 
-# ── Tables ──
-# Supports fnmatch globs (*, ?) in schema and table name
+# ── Таблицы ──────────────────────────────────────────────────────────────
+# fnmatch-паттерны: * = любые символы, ? = один символ
 tables:
-  - "dwh.*"              # all tables in dwh schema
-  - "stage.orders"       # exact table
-  - "dp_rid_*.*"         # all tables in schemas matching dp_rid_*
-  - "dp_rid_*.fact_*"    # tables matching fact_* in dp_rid_* schemas
+  - "dwh.*"              # все таблицы схемы dwh
+  - "stage.orders"       # конкретная таблица
+  - "dp_rid_*.*"         # все таблицы в схемах dp_rid_*
 
-# ── Column filters ──
-exclude_columns: []                       # exact: "schema.table.column"
-exclude_column_patterns: ["s_*", "tmp_*"] # fnmatch glob on column name
-# dtype_groups: ["text"]                  # only index these dtype groups
+# ── Фильтры колонок ─────────────────────────────────────────────────────
+exclude_columns: []                       # точные имена: "schema.table.column"
+exclude_column_patterns:                   # fnmatch на имя колонки
+  - "s__*"                                # служебные колонки
+  - "wf_load_*"                           # колонки загрузки
+# dtype_groups: ["text"]                  # индексировать только text
 
-# ── Storage ──
-store_type: "local"            # "local" (sqlite+.npy) or "db" (Greenplum table)
-index_dir: "./fp_index"        # directory for local store
-# storage_dsn: "postgresql://..."  # DB store connection (defaults to dsn)
+# ── Хранилище ───────────────────────────────────────────────────────────
+store_type: "local"            # local (sqlite+.npy) или db (Greenplum-таблица)
+index_dir: "./fp_index"        # каталог локального индекса
+# storage_dsn: "..."           # для DB-хранилища (по умолчанию = dsn)
 
-# ── Performance ──
-max_workers: 4                 # concurrent DB connections during indexing
-skip_text_avg_len: 500         # skip text columns with avg length > this
+# ── Производительность ───────────────────────────────────────────────────
+max_workers: 4                 # одновременных соединений с БД
+skip_text_avg_len: 500         # пропускать text-колонки со средней длиной > N
 
-# ── Matching ──
-min_containment: 0.3           # minimum containment for column pairing
-min_template_distinct: 5       # skip template columns with < N distinct values
+# ── Сопоставление ────────────────────────────────────────────────────────
+min_containment: 0.3            # порог containment для pairing/scoring
+candidate_min_containment: 0.3  # порог для candidates-списка (не влияет на score)
+min_template_distinct: 5        # мин. уникальных значений в колонке шаблона
 
-# ── Fuzzy matching ──
-# Tolerates typos/small edits in text columns (e.g. 'иванов' vs 'ивонов').
-# When disabled, behaviour is byte-identical to Phase 1.
+# ── Нечёткое сравнение (Phase 2) ─────────────────────────────────────────
 fuzzy:
-  enabled: false
-  ngram_size: 3                # n-gram size (like pg_trgm)
-  max_nd: 2000000              # max distinct values for n-gram indexing
-  columns: []                  # optional column whitelist (fnmatch globs)
-  alpha: 0.8                   # S = max(exact, alpha * ngram)
-  verify_sim_threshold: 0.4    # trigram_sim threshold for fuzzy row verification
+  enabled: true
+  ngram_size: 3                 # размер n-грамм (как pg_trgm)
+  max_nd: 2000000               # макс. unique для n-граммной индексации
+  columns: []                   # whitelist колонок (fnmatch), пусто = все text
+  alpha: 0.8                    # S = max(exact, α × ngram)
+  metric: jaccard               # jaccard или coverage_weighted (см. ниже)
+  verify_sim_threshold: 0.4     # порог trigram_sim для строковой верификации
 ```
 
-## Architecture
+### Метрики fuzzy
 
-### Phase 1 — exact containment
+| Метрика | Формула | Когда использовать |
+|---------|---------|-------------------|
+| `jaccard` | `|A∩B| / |A∪B|` | По умолчанию. Симметричная, устойчива к «губке» (длинный текст с кучей триграмм) |
+| `coverage_weighted` | `|A∩B|² / (|A|·|A∪B|)` | Когда важны колонки с *большим числом* попаданий триграмм шаблона (например, название месторождения как подстрока длинного description) |
 
-1. **Indexing** — per column: stats (n, unique, min/max, quantiles, avg_len)
-   + sorted int64 hashes → `.npy` or DB BYTEA.
-2. **Template loading** — read xlsx, canonicalize values, hash through DB using
-   the same SQL expressions as indexing. Returns both normalized values and
-   hashes per row.
-3. **Matching** — 4 stages:
-   - **Stage 0**: Prefilter by dtype compatibility and numeric range overlap.
-   - **Stage 1**: Containment matrix — `np.isin` of template hashes in DB column.
-   - **Stage 2**: Hungarian assignment weighted by selectivity (`log2(nd)`).
-   - **Stage 3**: Row verification — anchor column join, ≥80% column match.
+## 🧠 Как это работает
 
-### Phase 2 — n-gram fuzzy (opt-in)
-
-1. **Indexing** — for eligible text columns, stream *normalized* values,
-   build n-gram hash union in Python → `.ngrams.npy`.
-2. **Template** — compute n-gram hashes for text columns.
-3. **Matching** — `S[i,j] = max(exact, alpha * ngram)` for text-text pairs.
-   Exact pairs unaffected.
-4. **Verification** — fuzzy-matched columns use `trigram_sim` instead of
-   hash equality. Exact-matched anchor preferred.
-
-### Scoring formula
+### Индексация
 
 ```
-W[j]  = log2(nd_j + 1)          # selectivity weight
-pairs = hungarian(max S[i,j] × W[j])   # optimal assignment
-score = Σ(S[p] × W[p]) / Σ(W[p])       # weighted average
-score *= matched_cols / total_template_cols  # coverage penalty
+Config → crawl_columns (information_schema) → ColumnInfo[]
+→ ThreadPoolExecutor → index_column():
+  1. SQL: COUNT, COUNT DISTINCT, min/max/percentile_disc (или avg_len для text)
+  2. SQL: SELECT DISTINCT h64 → np.fromiter чанками → np.sort → .npy (mmap)
+  3. Если fuzzy+text: SELECT DISTINCT norm → add_ngram_hashes() → .ngrams.npy
+  4. ColumnRecord → catalog.db (SQLite)
 ```
 
-Normalization and hashing always run in SQL. N-gram hashing runs in Python
-but operates on *SQL-normalized* values only.
+### Поиск
 
-## Normalization & hashing
+```
+xlsx → load_template():
+  1. openpyxl → canonicalize_cell → infer_dtype_group (num/date/text)
+  2. SQL: unnest(значения) → (norm_v, h64) — нормализация ТОЛЬКО в БД
+  3. fuzzy+text: build_ngram_hashes() на SQL-нормализованных значениях
 
-| Type | SQL |
-|---|---|
-| Text / UUID | `lower(btrim(regexp_replace(x, '\s+', ' ', 'g')))` |
-| Numeric | Round to 6 decimals, strip trailing zeros |
-| Date / TS | `to_char(x, 'YYYY-MM-DD')` / `'YYYY-MM-DD"T"HH24:MI:SS'` |
-| Boolean | `CASE WHEN x THEN 'true' ELSE 'false' END` |
-| Hash (SQL) | `('x' \|\| substr(md5(norm), 1, 16))::bit(64)::bigint` |
-| Hash (Python) | `int.from_bytes(md5(s).digest()[:8], 'big', signed=True)` |
+→ Для каждой таблицы в индексе:
+  Stage 0: prefilter (dtype-совместимость + пересечение numeric-диапазонов)
+  Stage 1: containment matrix S[i,j] = max(exact, α × ngram)
+  Stage 2: Hungarian (scipy) + scoring = Σ(S·W)/Σ(W) × coverage
+  Stage 3: verify_rows (anchor-join, ≥80% колонок)
 
-## Testing
+→ TableMatch { score, mapping, candidates }
+```
+
+### Скоринг
+
+```
+W[j]   = log2(nd_j + 1)               # вес селективности колонки
+pairs  = hungarian(max S[i,j] × W[j])  # оптимальное назначение
+score  = Σ(S[p] × W[p]) / Σ(W[p])      # средневзвешенное
+score  *= matched / total              # штраф за неполноту покрытия
+```
+
+### Сравнение
+
+```
+Source-driven: строки БД — источник, строки шаблона подбираются
+Выравнивание: anchor-колонка (exact) + fuzzy fallback
+_classify_pair: exact (норм. равны) | fuzzy (row_similarity ≥ threshold) | none
+Подсветка: shared_trigram_spans — общие триграммы на обеих сторонах
+```
+
+## 📊 Формат отчётов
+
+Все HTML-отчёты **самодостаточны** — открываются из `file://`, не требуют
+интернета. Содержат inline CSS и JavaScript.
+
+| Отчёт | Формат | Особенности |
+|-------|--------|------------|
+| `report.html` | Таблица с результатами поиска | Сортировка, фильтр, score bar, exact/fuzzy теги |
+| `compare.html` | Построчное сравнение | Виртуальный скроллинг, resizable колонки, gzip+base64 blob |
+| `index.html` | Индекс сравнений | Список таблиц со ссылками на отдельные отчёты |
+
+## 🔧 Нормализация и хэширование
+
+**Критическое правило: вся нормализация и хэширование — только через SQL.**
+Никогда не нормализуй значения в Python.
+
+| Тип | SQL-нормализация | Хэш |
+|-----|-----------------|-----|
+| text / uuid | `lower(btrim(regexp_replace(x, '\s+', ' ', 'g')))` | `('x' \|\| substr(md5(norm), 1, 16))::bit(64)::bigint` |
+| num | round до 6 зн., обрезка нулей | md5 → int64 |
+| date | `to_char(x, 'YYYY-MM-DD')` | md5 → int64 |
+| timestamp | `to_char(x, 'YYYY-MM-DD"T"HH24:MI:SS')` | md5 → int64 |
+| bool | `CASE WHEN x THEN 'true' ELSE 'false' END` | md5 → int64 |
+
+## 📦 Зависимости
+
+| Пакет | Версия | Назначение |
+|-------|--------|-----------|
+| Python | ≥ 3.10 | – |
+| Greenplum / PostgreSQL | 6.24 / 9.4+ | База данных |
+| `psycopg2-binary` | – | Драйвер PostgreSQL |
+| `numpy` | – | Массивы хэшей, `np.isin`, mmap |
+| `scipy` | – | Hungarian algorithm |
+| `openpyxl` | – | Чтение xlsx |
+| `pyyaml` | – | Конфигурация |
+| `click` | – | CLI |
+| `tqdm` | – | Progress bar |
+
+## 🧪 Тестирование
 
 ```bash
-# All unit tests (38, no DB needed)
-pytest tablefp/tests/
-
-# Integration tests (requires DB)
-export POSTGRES_DSN="postgresql://..."
-pytest tablefp/tests/test_norm.py -m integration
+pytest tablefp/tests/                              # 72 юнит-теста
+pytest tablefp/tests/test_norm.py -m integration   # 9 интеграционных (нужен POSTGRES_DSN)
 ```
 
-## Requirements
+## 📖 Примеры
 
-- Python 3.10+
-- Greenplum 6.24 / PostgreSQL 9.4+
-- Dependencies: `psycopg2-binary`, `numpy`, `scipy`, `openpyxl`, `pyyaml`, `click`
+Пошаговые примеры на русском — [EXAMPLES.md](EXAMPLES.md).
