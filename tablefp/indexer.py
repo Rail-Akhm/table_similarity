@@ -1,11 +1,16 @@
 """Build column fingerprints."""
 
 import fnmatch
+import json
 import logging
 import os
+import shutil
+import struct
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -21,6 +26,165 @@ from tablefp.store import ArtifactStore, ColumnRecord
 
 logger = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------------- #
+# Low-memory streaming helpers
+# --------------------------------------------------------------------------- #
+
+
+def _write_npy_header(f, shape, dtype=np.dtype("<i8")):
+    """Write .npy v1.0 header to an open file.
+
+    Produces exactly the same format as ``np.save`` so the result is loadable
+    with ``np.load(path, mmap_mode="r")``.
+    """
+    # .npy header MUST be a Python literal (evaluated by ast.literal_eval),
+    # NOT JSON.  ``False`` / ``True``, not ``false`` / ``true``.
+    header = (
+        "{" +
+        f"'descr': '{dtype.str}', 'fortran_order': False, 'shape': {shape}"
+        + "}"
+    )
+    header_bytes = header.encode("ascii")
+
+    # Total fixed overhead before header: magic(6) + version(2) + header_len(2) = 10.
+    # The spec says the whole header (10 + len(header_padded)) must align data to
+    # a 16-byte boundary.  We follow numpy's convention: pad header to make
+    # 10 + len(header_padded) ≡ 0 (mod 16).
+    target = len(header_bytes) + 1  # +1 for the mandatory '\n'
+    remainder = (10 + target) % 16
+    pad = (16 - remainder) % 16
+    padded = header_bytes + b" " * pad + b"\n"
+
+    f.write(b"\x93NUMPY")          # magic
+    f.write(b"\x01")               # major version
+    f.write(b"\x00")               # minor version
+    f.write(struct.pack("<H", len(padded)))
+    f.write(padded)
+
+
+def _stream_sorted_hashes_to_npy(cursor, nd, npy_path):
+    """Stream sorted int64 hashes from a cursor directly into a ``.npy`` file.
+
+    The cursor MUST already be executing a query that returns rows ordered by
+    the hash column (``ORDER BY 1``).  Hashes are written to disk in small
+    batches — peak memory is O(batch_size), not O(nd).
+    """
+    batch_size = 100_000
+    written = 0
+
+    with open(npy_path, "wb") as f:
+        _write_npy_header(f, (nd,), np.dtype("<i8"))
+
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                break
+            batch = np.array([r[0] for r in rows], dtype=np.int64)
+            f.write(batch.tobytes())
+            written += len(batch)
+
+    # Safety: if row count changed between stats and hash query, fix the header
+    if written != nd:
+        logger.warning(
+            f"Hash count mismatch: expected {nd}, got {written}. "
+            f"Fixing header (this is harmless)."
+        )
+        # Re-write header with correct shape
+        data = np.memmap(npy_path, dtype=np.int64, mode="r", offset=0)
+        actual = np.array(data[:written], dtype=np.int64)
+        del data
+        np.save(npy_path, actual)
+
+
+def _build_ngrams_batched(norm_query, conn, ngram_size, ngrams_path):
+    """Build n-gram hashes in batches and merge to a single ``.ngrams.npy``.
+
+    Each batch fetches at most 100 000 normalised values, builds sorted
+    deduplicated n-gram hashes via ``build_ngram_hashes``, and saves the
+    batch to a temporary file.  Afterwards all batches are merged with a
+    k-way heap merge + dedup that streams the result to disk.
+    """
+    BATCH = 100_000
+    tmp_dir = Path(ngrams_path).parent / ".ngram_tmp_" + Path(ngrams_path).name
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    batch_files = []
+    try:
+        # --- Phase 1: build per-batch .npy files ---
+        with get_cursor(conn) as cur:
+            cur.execute(norm_query)
+            batch_idx = 0
+            while True:
+                rows = cur.fetchmany(BATCH)
+                if not rows:
+                    break
+                values = [r[0] for r in rows]
+                ngram_hashes = build_ngram_hashes(values, n=ngram_size)
+                if len(ngram_hashes) == 0:
+                    continue
+                bf = tmp_dir / f"b_{batch_idx:06d}.npy"
+                np.save(str(bf), ngram_hashes)
+                batch_files.append(str(bf))
+                batch_idx += 1
+                logger.debug(f"  ngram batch {batch_idx}: {len(values):,} values → {len(ngram_hashes):,} hashes")
+
+        if not batch_files:
+            np.save(ngrams_path, np.array([], dtype=np.int64))
+            return
+
+        # --- Phase 2: k-way heap merge + dedup → final file ---
+        _merge_sorted_dedup(batch_files, ngrams_path)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _merge_sorted_dedup(temp_files, output_path):
+    """k-way merge of sorted int64 .npy files, deduplicating across batches."""
+    import heapq
+
+    arrays = []
+    positions = []
+    for f in temp_files:
+        arr = np.load(f, mmap_mode="r")
+        if len(arr) > 0:
+            arrays.append(arr)
+            positions.append(0)
+
+    if not arrays:
+        np.save(output_path, np.array([], dtype=np.int64))
+        return
+
+    # Initial heap: (value, array_index)
+    heap = []
+    for i in range(len(arrays)):
+        heapq.heappush(heap, (int(arrays[i][0]), i))
+        positions[i] = 1
+
+    out_batches = []
+    out_buf = []
+    last_val = None
+
+    while heap:
+        val, i = heapq.heappop(heap)
+        if last_val is None or val != last_val:
+            out_buf.append(val)
+            last_val = val
+            if len(out_buf) >= 50_000:
+                out_batches.append(np.array(out_buf, dtype=np.int64))
+                out_buf = []
+
+        if positions[i] < len(arrays[i]):
+            next_val = int(arrays[i][positions[i]])
+            heapq.heappush(heap, (next_val, i))
+            positions[i] += 1
+
+    if out_buf:
+        out_batches.append(np.array(out_buf, dtype=np.int64))
+
+    result = np.concatenate(out_batches) if out_batches else np.array([], dtype=np.int64)
+    np.save(output_path, result)
+    logger.debug(f"  merged {len(temp_files)} batches → {len(result):,} unique n-gram hashes")
+
 
 def index_column(
     conn: psycopg2.extensions.connection,
@@ -29,10 +193,15 @@ def index_column(
     skip_text_avg_len: int,
     force: bool = False,
     fuzzy_config: Optional[dict] = None,
+    low_memory: bool = False,
 ) -> Optional[ColumnRecord]:
     """Index a single column.
 
     Returns ColumnRecord on success, None if skipped.
+
+    When *low_memory* is True the function uses DB-side ``ORDER BY`` +
+    direct-to-disk streaming for hashes and batch-processing for n-grams,
+    keeping peak memory O(batch_size) instead of O(nd).
     """
     start_time = time.time()
 
@@ -121,65 +290,150 @@ def index_column(
             logger.info(f"Skipping {column.schema}.{column.table_name}.{column.column_name} (avg_len={avg_len:.1f} > {skip_text_avg_len})")
             return None
 
-    # Stage 2: Stream distinct hashes
-    logger.debug(f"Streaming distinct values...")
-    hashes_query = f"""
-        SELECT DISTINCT {h64_expr}
-        FROM {column.schema}.{column.table_name}
-        WHERE {norm_expr} IS NOT NULL
-    """
-
-    hashes = []
-    try:
-        with get_cursor(conn) as cur:
-            cur.execute(hashes_query)
-            while True:
-                rows = cur.fetchmany(50000)
-                if not rows:
-                    break
-                for (h,) in rows:
-                    hashes.append(h)
-    except Exception as e:
-        raise RuntimeError(f"hash query failed: {e}") from e
-
-    # Sort and save
-    hashes_array = np.sort(np.array(hashes, dtype=np.int64))
-
-    npy_path = store.save_hashes(column.schema, column.table_name, column.column_name, hashes_array)
-
-    # N-gram hashes for eligible text columns
+    # Stage 2: Stream / collect distinct hashes
+    npy_path = ""
     ngrams_path = ""
-    if column.dtype_group == "text" and fuzzy_config and fuzzy_config.get("enabled"):
-        fc = fuzzy_config
-        eligible = (nd <= fc.get("max_nd", 2_000_000))
-        fc_cols = fc.get("columns", []) or []
-        if any(fnmatch.fnmatch(column.column_name, p) for p in fc_cols):
-            eligible = True
-        if eligible:
-            logger.debug(f"Building n-grams for {column.schema}.{column.table_name}.{column.column_name}")
-            norm_query = f"""
-                SELECT DISTINCT {norm_expr}
-                FROM {column.schema}.{column.table_name}
-                WHERE {norm_expr} IS NOT NULL
-            """
-            norm_values = []
-            try:
-                with get_cursor(conn) as cur:
-                    cur.execute(norm_query)
-                    while True:
-                        rows = cur.fetchmany(50000)
-                        if not rows:
-                            break
-                        for (v,) in rows:
-                            norm_values.append(v)
-            except Exception as e:
-                raise RuntimeError(f"n-gram query failed: {e}") from e
 
-            ngrams_array = build_ngram_hashes(norm_values, n=fc.get("ngram_size", 3))
-            ngrams_path = store.save_ngrams(
-                column.schema, column.table_name, column.column_name, ngrams_array
-            )
-            logger.debug(f"  {len(ngrams_array)} n-gram hashes")
+    if low_memory:
+        # ── low-memory path: DB-side ORDER BY + direct-to-disk streaming ──
+        logger.debug(f"Streaming distinct hashes (low-memory, ORDER BY in DB)...")
+        hashes_query = f"""
+            SELECT DISTINCT {h64_expr}
+            FROM {column.schema}.{column.table_name}
+            WHERE {norm_expr} IS NOT NULL
+            ORDER BY 1
+        """
+
+        # For ArtifactStore (local) we write the final .npy directly.
+        # For DBArtifactStore we stream to a temp file, then mmap-load and
+        # pass through store.save_hashes() (BYTEA serialisation is unavoidable).
+        if isinstance(store, ArtifactStore):
+            table_dir = Path(store.index_dir) / column.schema / column.table_name
+            os.makedirs(table_dir, exist_ok=True)
+            npy_path = str(table_dir / f"{column.column_name}.npy")
+            npy_tmp = None
+        else:
+            _tmp = tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
+            npy_path = _tmp.name
+            _tmp.close()
+            npy_tmp = npy_path  # will be cleaned up after store.save_hashes
+
+        try:
+            with get_cursor(conn) as cur:
+                cur.execute(hashes_query)
+                _stream_sorted_hashes_to_npy(cur, nd, npy_path)
+        except Exception as e:
+            raise RuntimeError(f"low-memory hash streaming failed: {e}") from e
+
+        # For DB store: mmap the temp .npy and save through the store
+        if npy_tmp is not None:
+            try:
+                hashes_mmap = np.load(npy_path, mmap_mode="r")
+                npy_path = store.save_hashes(
+                    column.schema, column.table_name, column.column_name, hashes_mmap
+                )
+            finally:
+                try:
+                    os.unlink(npy_tmp)
+                except OSError:
+                    pass
+
+        # N-gram hashes — batch-processed (low-memory)
+        if column.dtype_group == "text" and fuzzy_config and fuzzy_config.get("enabled"):
+            fc = fuzzy_config
+            eligible = (nd <= fc.get("max_nd", 2_000_000))
+            fc_cols = fc.get("columns", []) or []
+            if any(fnmatch.fnmatch(column.column_name, p) for p in fc_cols):
+                eligible = True
+            if eligible:
+                logger.debug(f"Building n-grams (batched) for {column.schema}.{column.table_name}.{column.column_name}")
+                norm_query = f"""
+                    SELECT DISTINCT {norm_expr}
+                    FROM {column.schema}.{column.table_name}
+                    WHERE {norm_expr} IS NOT NULL
+                """
+                if isinstance(store, ArtifactStore):
+                    table_dir = Path(store.index_dir) / column.schema / column.table_name
+                    os.makedirs(table_dir, exist_ok=True)
+                    ngrams_path = str(table_dir / f"{column.column_name}.ngrams.npy")
+                    try:
+                        _build_ngrams_batched(norm_query, conn, fc.get("ngram_size", 3), ngrams_path)
+                    except Exception as e:
+                        raise RuntimeError(f"batched n-gram build failed: {e}") from e
+                else:
+                    # DB store: batch to temp, mmap, save through store
+                    _tmp2 = tempfile.NamedTemporaryFile(suffix=".ngrams.npy", delete=False)
+                    _tmp2.close()
+                    try:
+                        _build_ngrams_batched(norm_query, conn, fc.get("ngram_size", 3), _tmp2.name)
+                        ngrams_mmap = np.load(_tmp2.name, mmap_mode="r")
+                        ngrams_path = store.save_ngrams(
+                            column.schema, column.table_name, column.column_name, ngrams_mmap
+                        )
+                    finally:
+                        try:
+                            os.unlink(_tmp2.name)
+                        except OSError:
+                            pass
+    else:
+        # ── normal path: collect in Python, sort, save (original behaviour) ──
+        logger.debug(f"Streaming distinct values...")
+        hashes_query = f"""
+            SELECT DISTINCT {h64_expr}
+            FROM {column.schema}.{column.table_name}
+            WHERE {norm_expr} IS NOT NULL
+        """
+
+        hashes = []
+        try:
+            with get_cursor(conn) as cur:
+                cur.execute(hashes_query)
+                while True:
+                    rows = cur.fetchmany(50000)
+                    if not rows:
+                        break
+                    for (h,) in rows:
+                        hashes.append(h)
+        except Exception as e:
+            raise RuntimeError(f"hash query failed: {e}") from e
+
+        # Sort and save
+        hashes_array = np.sort(np.array(hashes, dtype=np.int64))
+
+        npy_path = store.save_hashes(column.schema, column.table_name, column.column_name, hashes_array)
+
+        # N-gram hashes for eligible text columns
+        if column.dtype_group == "text" and fuzzy_config and fuzzy_config.get("enabled"):
+            fc = fuzzy_config
+            eligible = (nd <= fc.get("max_nd", 2_000_000))
+            fc_cols = fc.get("columns", []) or []
+            if any(fnmatch.fnmatch(column.column_name, p) for p in fc_cols):
+                eligible = True
+            if eligible:
+                logger.debug(f"Building n-grams for {column.schema}.{column.table_name}.{column.column_name}")
+                norm_query = f"""
+                    SELECT DISTINCT {norm_expr}
+                    FROM {column.schema}.{column.table_name}
+                    WHERE {norm_expr} IS NOT NULL
+                """
+                norm_values = []
+                try:
+                    with get_cursor(conn) as cur:
+                        cur.execute(norm_query)
+                        while True:
+                            rows = cur.fetchmany(50000)
+                            if not rows:
+                                break
+                            for (v,) in rows:
+                                norm_values.append(v)
+                except Exception as e:
+                    raise RuntimeError(f"n-gram query failed: {e}") from e
+
+                ngrams_array = build_ngram_hashes(norm_values, n=fc.get("ngram_size", 3))
+                ngrams_path = store.save_ngrams(
+                    column.schema, column.table_name, column.column_name, ngrams_array
+                )
+                logger.debug(f"  {len(ngrams_array)} n-gram hashes")
 
     # Create record
     elapsed = time.time() - start_time
@@ -220,6 +474,7 @@ def index_tables(
     force: bool = False,
     fuzzy_config: Optional[dict] = None,
     dtype_groups: Optional[List[str]] = None,
+    low_memory: bool = False,
 ):
     """Index all configured tables."""
     conn = get_connection(dsn)
@@ -230,6 +485,19 @@ def index_tables(
         logger.warning("No columns found to index")
         conn.close()
         return
+
+    # Low-memory mode: single worker avoids concurrent allocations
+    if low_memory:
+        if max_workers > 1:
+            logger.info(
+                f"Low-memory mode: limiting workers from {max_workers} to 1 "
+                f"(set low_memory: false to restore parallelism)"
+            )
+        max_workers = 1
+        logger.info(
+            f"Low-memory mode enabled: DB-side ORDER BY + disk streaming, "
+            f"batched n-gram processing"
+        )
 
     # Index in parallel
     failed = []
@@ -246,6 +514,7 @@ def index_tables(
                 skip_text_avg_len,
                 force,
                 fuzzy_config,
+                low_memory=low_memory,
             )
         finally:
             worker_conn.close()

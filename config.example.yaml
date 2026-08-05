@@ -49,6 +49,11 @@ index_dir: "./fp_index"
 # Maximum concurrent DB connections during indexing
 max_workers: 4
 
+# Low-memory mode: streams data directly to disk via DB-side ORDER BY + batch
+# processing. Uses ~10× less RAM per column at the cost of ~20% slower indexing.
+# Set to true when indexing large tables with limited RAM.
+low_memory: false
+
 # Skip text columns with average normalized length > this value
 skip_text_avg_len: 500
 
