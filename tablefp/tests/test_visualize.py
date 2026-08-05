@@ -50,6 +50,60 @@ def test_compare_index_lists_entries_sorted_with_links():
         out.unlink(missing_ok=True)
 
 
+def test_compare_payload_places_template_columns_on_the_left():
+    from tablefp.visualize import _build_compare_payload
+
+    data = {
+        "table": "s.t", "score": 0.9, "verified_row_ratio": None, "anchor": "name",
+        "columns_mode": "all",
+        "source_columns": ["name", "age"],
+        "target_columns": ["Name", "Comment"],
+        "matched_pairs": [{
+            "source_col": "name", "target_col": "Name", "kind": "exact",
+            "containment": 0.9, "is_anchor": True,
+            "exact_containment": 0.9, "ngram_containment": None,
+        }],
+        "rows": [{
+            "m": True,
+            "c": [
+                {"v": "Alice", "k": "exact"},
+                {"v": "hi"},
+                {"v": "Alice", "k": "exact"},
+                {"v": "30"},
+            ],
+        }],
+    }
+    payload = _build_compare_payload(data)
+
+    kinds = [c["k"] for c in payload["cols"]]
+    assert kinds == ["rownum", "tgt", "tgt", "divider", "src", "src"]
+    # row cells pass through as-is (payload-shaped in build_comparison)
+    assert [c["v"] for c in payload["rows"][0]["c"]] == ["Alice", "hi", "Alice", "30"]
+
+
+def test_generate_comparison_report_closes_script_tag(tmp_path):
+    from tablefp.visualize import generate_comparison_report
+
+    data = {
+        "table": "s.t", "score": 0.9, "verified_row_ratio": None, "anchor": "name",
+        "columns_mode": "all",
+        "source_columns": ["name"],
+        "target_columns": ["Name"],
+        "matched_pairs": [{
+            "source_col": "name", "target_col": "Name", "kind": "exact",
+            "containment": 0.9, "is_anchor": True,
+            "exact_containment": 0.9, "ngram_containment": None,
+        }],
+        "rows": [{"m": True, "c": [{"v": "Alice", "k": "exact"}, {"v": "Alice", "k": "exact"}]}],
+    }
+    out = tmp_path / "cmp.html"
+    generate_comparison_report(data, str(out))
+    html = out.read_text(encoding="utf-8")
+    assert html.count("<script>") == 1
+    assert "</script>" in html
+    assert html.rstrip().endswith("</html>")
+
+
 def test_generate_report_reads_total_tables_from_json(tmp_path):
     data = {"template": "f.xlsx", "total_tables": 42, "results": []}
     j = tmp_path / "r.json"

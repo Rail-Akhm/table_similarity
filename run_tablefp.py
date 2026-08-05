@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""Direct entry point for tablefp CLI - no installation required.
-
-Usage:
-    python run_tablefp.py --help
-    python run_tablefp.py index --config config/config.yaml
-    python run_tablefp.py search fields.xlsx --config config/config.yaml
-"""
-
 import sys
 from pathlib import Path
 

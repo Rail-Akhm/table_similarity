@@ -68,7 +68,6 @@ def index(config: str, tables: tuple, force: bool, verbose: bool):
         force=force,
         fuzzy_config=cfg.fuzzy,
         dtype_groups=cfg.dtype_groups,
-        max_memory_mb=cfg.max_memory_mb,
     )
 
 
@@ -194,49 +193,10 @@ def search(template: str, config: str, top: int, no_verify: bool, sheet: str, no
 
     output = {
         "template": template,
-        "results": [],
+        "results": [_match_result_dict(m) for m in results],
         "total_tables": len(tables),
         "generated_at": datetime.now().isoformat(),
     }
-
-    for match in results:
-        result = {
-            "table": f"{match.schema}.{match.table_name}",
-            "score": round(float(match.score), 4),
-            "verified_row_ratio": float(match.verified_row_ratio) if match.verified_row_ratio is not None else None,
-            "mapping": [
-                {
-                    "template_col": int(m.template_col_idx),
-                    "template_name": m.template_col_name,
-                    "db_column": m.db_column,
-                    "containment": round(float(m.containment), 4),
-                    "exact_containment": round(float(m.exact_containment), 4),
-                    "ngram_containment": round(float(m.ngram_containment), 4) if m.ngram_containment is not None else None,
-                    "unique": int(m.nd),
-                }
-                for m in match.mapping
-            ],
-            "unmatched_template_cols": [int(i) for i in match.unmatched_template_cols],
-            "candidates": [
-                {
-                    "template_col": int(c.template_col_idx),
-                    "template_name": c.template_col_name,
-                    "db_column": c.db_column,
-                    "containment": round(float(c.containment), 4),
-                    "exact_containment": round(float(c.exact_containment), 4),
-                    "ngram_containment": round(float(c.ngram_containment), 4) if c.ngram_containment is not None else None,
-                    "kind": (
-                        "fuzzy"
-                        if (c.ngram_containment is not None
-                            and c.ngram_containment > c.exact_containment)
-                        else "exact"
-                    ),
-                    "unique": int(c.nd),
-                }
-                for c in getattr(match, "candidates", [])
-            ],
-        }
-        output["results"].append(result)
 
     # Print report
     if not results:
@@ -271,9 +231,58 @@ def search(template: str, config: str, top: int, no_verify: bool, sheet: str, no
         click.echo(f"JSON written to {out}")
 
 
+def _match_result_dict(match) -> dict:
+    """Serialize a TableMatch into a search-result dict (used by search and run)."""
+    return {
+        "table": f"{match.schema}.{match.table_name}",
+        "score": round(float(match.score), 4),
+        "verified_row_ratio": (
+            float(match.verified_row_ratio)
+            if match.verified_row_ratio is not None else None
+        ),
+        "mapping": [
+            {
+                "template_col": int(m.template_col_idx),
+                "template_name": m.template_col_name,
+                "db_column": m.db_column,
+                "containment": round(float(m.containment), 4),
+                "exact_containment": round(float(m.exact_containment), 4),
+                "ngram_containment": (
+                    round(float(m.ngram_containment), 4)
+                    if m.ngram_containment is not None else None
+                ),
+                "unique": int(m.nd),
+            }
+            for m in match.mapping
+        ],
+        "unmatched_template_cols": [int(i) for i in match.unmatched_template_cols],
+        "candidates": [
+            {
+                "template_col": int(c.template_col_idx),
+                "template_name": c.template_col_name,
+                "db_column": c.db_column,
+                "containment": round(float(c.containment), 4),
+                "exact_containment": round(float(c.exact_containment), 4),
+                "ngram_containment": (
+                    round(float(c.ngram_containment), 4)
+                    if c.ngram_containment is not None else None
+                ),
+                "kind": (
+                    "fuzzy"
+                    if (c.ngram_containment is not None
+                        and c.ngram_containment > c.exact_containment)
+                    else "exact"
+                ),
+                "unique": int(c.nd),
+            }
+            for c in getattr(match, "candidates", [])
+        ],
+    }
+
+
 def _build_compare_data(conn, template_path, sheet, no_header, tmpl, db_columns, match,
                         cfg, fuzzy_enabled, limit, columns_mode, only_matched,
-                        all_template_cols, no_verify):
+                        all_template_cols, no_verify, only_hit_columns):
     """Verify rows + build the comparison data dict for one table.
 
     Shared by single-table (`compare --table`) and batch (`compare --top`) modes.
@@ -292,6 +301,8 @@ def _build_compare_data(conn, template_path, sheet, no_header, tmpl, db_columns,
         except Exception as e:
             logger.debug(f"verify failed: {e}")
 
+    limit = limit or None  # 0 => unlimited
+
     extra_target_columns = []
     if columns_mode == "all" or all_template_cols:
         matched_names = {tmpl.columns[m.template_col_idx].name for m in match.mapping}
@@ -309,6 +320,7 @@ def _build_compare_data(conn, template_path, sheet, no_header, tmpl, db_columns,
         verify_sim_threshold=cfg.fuzzy.get("verify_sim_threshold", 0.4),
         columns_mode=columns_mode, extra_target_columns=extra_target_columns,
         only_matched=only_matched, all_template_columns=all_template_cols,
+        only_hit_columns=only_hit_columns,
     )
 
 
@@ -320,13 +332,15 @@ def _build_compare_data(conn, template_path, sheet, no_header, tmpl, db_columns,
               help="Batch mode: generate compare reports for top N matched tables by score")
 @click.option("--out", "-o", default="compare.html",
               help="Output HTML file (single) or directory (batch, default compare_reports)")
-@click.option("--limit", type=int, default=None, help="Max rows to compare (default: unlimited)")
+@click.option("--limit", type=int, default=None, help="Max rows to compare (default: unlimited; 0 = unlimited)")
 @click.option("--sheet", help="Sheet name (default: first sheet)")
 @click.option("--no-header", is_flag=True, help="Template has no header row")
 @click.option("--no-verify", is_flag=True, help="Skip row verification")
 @click.option("--columns", "columns_mode", type=click.Choice(["all", "matched"]), default="all",
               help="Show all columns or only matched columns (default: all)")
 @click.option("--only-matched", is_flag=True, help="Show only rows with at least one column match")
+@click.option("--only-hit-cols/--no-only-hit-cols", "only_hit_cols", default=True,
+              help="Show only columns with at least one cell match (default: on; disable with --no-only-hit-cols)")
 @click.option("--all-template-cols/--no-all-template-cols", "all_template_cols", default=True,
               help="Show all template columns even without matches (default: on)")
 @click.option("--min-distinct", type=int, help="Override min_template_distinct threshold")
@@ -334,7 +348,7 @@ def _build_compare_data(conn, template_path, sheet, no_header, tmpl, db_columns,
 @click.option("--fuzzy/--no-fuzzy", default=None, help="Enable/disable fuzzy matching (default: from config)")
 def compare(template: str, config: str, table: Optional[str], top: Optional[int], out: str,
             limit: Optional[int], sheet: str, no_header: bool, no_verify: bool, columns_mode: str,
-            only_matched: bool, all_template_cols: bool, min_distinct: Optional[int],
+            only_matched: bool, only_hit_cols: bool, all_template_cols: bool, min_distinct: Optional[int],
             verbose: bool, fuzzy: Optional[bool]):
     """Side-by-side row comparison of a template against matched table(s).
 
@@ -377,18 +391,18 @@ def compare(template: str, config: str, table: Optional[str], top: Optional[int]
         if table is not None:
             _compare_single(template, table, out, tmpl, store, conn, cfg, fuzzy_enabled,
                             limit, sheet, no_header, no_verify, columns_mode,
-                            only_matched, all_template_cols)
+                            only_matched, all_template_cols, only_hit_cols)
         else:
             _compare_batch(template, top, out, tmpl, store, conn, cfg, fuzzy_enabled,
                            limit, sheet, no_header, no_verify, columns_mode,
-                           only_matched, all_template_cols)
+                           only_matched, all_template_cols, only_hit_cols)
     finally:
         conn.close()
 
 
 def _compare_single(template, table, out, tmpl, store, conn, cfg, fuzzy_enabled,
                     limit, sheet, no_header, no_verify, columns_mode,
-                    only_matched, all_template_cols):
+                    only_matched, all_template_cols, only_hit_cols):
     if "." not in table:
         click.echo("ERROR: --table must be schema.table", err=True)
         sys.exit(1)
@@ -424,7 +438,7 @@ def _compare_single(template, table, out, tmpl, store, conn, cfg, fuzzy_enabled,
 
     data = _build_compare_data(conn, template, sheet, no_header, tmpl, db_columns, match,
                                cfg, fuzzy_enabled, limit, columns_mode, only_matched,
-                               all_template_cols, no_verify)
+                               all_template_cols, no_verify, only_hit_cols)
 
     click.echo(f"Columns with actual row hits ({len(data['matched_pairs'])}):")
     for p in data["matched_pairs"]:
@@ -438,12 +452,8 @@ def _compare_single(template, table, out, tmpl, store, conn, cfg, fuzzy_enabled,
     generate_comparison_report(data, out)
 
 
-def _compare_batch(template, top, out, tmpl, store, conn, cfg, fuzzy_enabled,
-                   limit, sheet, no_header, no_verify, columns_mode,
-                   only_matched, all_template_cols):
-    outdir = out if out != "compare.html" else "compare_reports"
-    os.makedirs(outdir, exist_ok=True)
-
+def _match_all_tables(tmpl, store, cfg, fuzzy_enabled):
+    """Match the template against every indexed table; sorted by score desc."""
     all_columns = store.list_columns()
     tables: dict = {}
     for col in all_columns:
@@ -469,20 +479,20 @@ def _compare_batch(template, top, out, tmpl, store, conn, cfg, fuzzy_enabled,
         matched.append((m, db_columns))
 
     matched.sort(key=lambda x: x[0].score, reverse=True)
-    matched = matched[:top]
-    if not matched:
-        click.echo("No matching tables found.")
-        return
+    return matched, len(tables)
 
-    click.echo(f"Generating compare reports for top {len(matched)} tables ...")
 
+def _generate_compare_reports(conn, template, sheet, no_header, tmpl, cfg, fuzzy_enabled,
+                              limit, columns_mode, only_matched, all_template_cols,
+                              no_verify, only_hit_cols, matched, outdir):
+    """Write one compare report per matched table plus an index.html."""
     from tablefp.visualize import generate_comparison_report, generate_compare_index
 
     entries = []
     for i, (m, db_columns) in enumerate(matched, 1):
         data = _build_compare_data(conn, template, sheet, no_header, tmpl, db_columns, m,
                                    cfg, fuzzy_enabled, limit, columns_mode, only_matched,
-                                   all_template_cols, no_verify)
+                                   all_template_cols, no_verify, only_hit_cols)
         fname = f"{m.schema}.{m.table_name}.html"
         generate_comparison_report(data, os.path.join(outdir, fname))
         entries.append({
@@ -490,7 +500,7 @@ def _compare_batch(template, top, out, tmpl, store, conn, cfg, fuzzy_enabled,
             "table": f"{m.schema}.{m.table_name}",
             "score": float(m.score),
             "verified": m.verified_row_ratio,
-            "n_matched": sum(1 for r in data["rows"] if r.get("matched")),
+            "n_matched": sum(1 for r in data["rows"] if r.get("m")),
             "n_rows": len(data["rows"]),
         })
         click.echo(f"  {i:02d}. {m.schema}.{m.table_name}  score={m.score:.4f}  -> {fname}")
@@ -499,6 +509,119 @@ def _compare_batch(template, top, out, tmpl, store, conn, cfg, fuzzy_enabled,
     generate_compare_index(entries, idx_path, template_name=template)
     click.echo()
     click.echo(f"Index: {idx_path}")
+
+
+def _compare_batch(template, top, out, tmpl, store, conn, cfg, fuzzy_enabled,
+                   limit, sheet, no_header, no_verify, columns_mode,
+                   only_matched, all_template_cols, only_hit_cols):
+    outdir = out if out != "compare.html" else "compare_reports"
+    os.makedirs(outdir, exist_ok=True)
+
+    matched, _ = _match_all_tables(tmpl, store, cfg, fuzzy_enabled)
+    matched = matched[:top]
+    if not matched:
+        click.echo("No matching tables found.")
+        return
+
+    click.echo(f"Generating compare reports for top {len(matched)} tables ...")
+    _generate_compare_reports(conn, template, sheet, no_header, tmpl, cfg, fuzzy_enabled,
+                              limit, columns_mode, only_matched, all_template_cols,
+                              no_verify, only_hit_cols, matched, outdir)
+
+
+@cli.command()
+@click.argument("template")
+@click.option("--config", required=True, help="Path to config.yaml")
+@click.option("--top", default=5, help="Number of top results to report and compare")
+@click.option("--out", "-o", default="run_reports", help="Output directory (default: run_reports)")
+@click.option("--limit", type=int, default=None, help="Max rows to compare (default: unlimited; 0 = unlimited)")
+@click.option("--sheet", help="Sheet name (default: first sheet)")
+@click.option("--no-header", is_flag=True, help="Template has no header row")
+@click.option("--no-verify", is_flag=True, help="Skip row verification")
+@click.option("--columns", "columns_mode", type=click.Choice(["all", "matched"]), default="all",
+              help="Show all columns or only matched columns (default: all)")
+@click.option("--only-matched", is_flag=True, help="Show only rows with at least one column match")
+@click.option("--only-hit-cols/--no-only-hit-cols", "only_hit_cols", default=True,
+              help="Show only columns with at least one cell match (default: on; disable with --no-only-hit-cols)")
+@click.option("--all-template-cols/--no-all-template-cols", "all_template_cols", default=True,
+              help="Show all template columns even without matches (default: on)")
+@click.option("--min-distinct", type=int, help="Override min_template_distinct threshold")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+@click.option("--fuzzy/--no-fuzzy", default=None, help="Enable/disable fuzzy matching (default: from config)")
+def run(template: str, config: str, top: int, out: str, limit: Optional[int], sheet: str,
+        no_header: bool, no_verify: bool, columns_mode: str, only_matched: bool,
+        only_hit_cols: bool, all_template_cols: bool, min_distinct: Optional[int],
+        verbose: bool, fuzzy: Optional[bool]):
+    """Search, build the search report, then compare top tables and build compare reports.
+
+    Runs the full flow in one command: match every indexed table against the
+    template, write search.json + report.html, then generate a compare report
+    for each top-N table plus an index.html into the output directory.
+    """
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    cfg = Config.from_yaml(config)
+    store = create_store(cfg)
+    fuzzy_enabled = cfg.fuzzy.get("enabled", False) if fuzzy is None else fuzzy
+    min_tmpl_distinct = cfg.min_template_distinct if min_distinct is None else min_distinct
+
+    os.makedirs(out, exist_ok=True)
+
+    conn = get_connection(cfg.dsn)
+    try:
+        try:
+            tmpl = load_template(
+                template, conn,
+                sheet_name=sheet,
+                header=None if not no_header else False,
+                min_template_distinct=min_tmpl_distinct,
+                fuzzy_enabled=fuzzy_enabled,
+                ngram_size=cfg.fuzzy.get("ngram_size", 3),
+            )
+        except Exception as e:
+            click.echo(f"ERROR: Failed to load template: {e}", err=True)
+            sys.exit(1)
+        if not tmpl.columns:
+            click.echo("ERROR: No valid columns in template", err=True)
+            sys.exit(1)
+
+        click.echo(f"Columns loaded from template: {len(tmpl.columns)}")
+        matched, total_tables = _match_all_tables(tmpl, store, cfg, fuzzy_enabled)
+        if not matched:
+            click.echo("No matching tables found.")
+            return
+        matched = matched[:top]
+
+        if not no_verify:
+            for m, db_columns in matched:
+                m.verified_row_ratio = verify_rows(
+                    conn, m, tmpl.columns, db_columns,
+                    fuzzy_enabled=fuzzy_enabled,
+                    min_containment=cfg.min_containment,
+                    verify_sim_threshold=cfg.fuzzy.get("verify_sim_threshold", 0.4),
+                )
+
+        output = {
+            "template": template,
+            "results": [_match_result_dict(m) for m, _ in matched],
+            "total_tables": total_tables,
+            "generated_at": datetime.now().isoformat(),
+        }
+        search_json = os.path.join(out, "search.json")
+        with open(search_json, "w") as f:
+            json.dump(output, f, indent=2)
+        click.echo(f"JSON written to {search_json}")
+
+        from tablefp.visualize import generate_report
+        generate_report([search_json], os.path.join(out, "report.html"))
+
+        click.echo(f"Generating compare reports for top {len(matched)} tables ...")
+        _generate_compare_reports(conn, template, sheet, no_header, tmpl, cfg, fuzzy_enabled,
+                                  limit, columns_mode, only_matched, all_template_cols,
+                                  True, only_hit_cols, matched, out)
+    finally:
+        conn.close()
 
 
 @cli.command()

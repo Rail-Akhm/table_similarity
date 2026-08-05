@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -143,77 +143,42 @@ def stage1_containment(
     fuzzy_enabled: bool = False,
     fuzzy_alpha: float = 0.8,
     fuzzy_metric: str = "jaccard",
-) -> np.ndarray:
-    """Stage 1: Build containment matrix.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Stage 1: Build containment matrices.
 
-    S[i, j] = fraction of template column i's hashes found in DB column j.
-    When fuzzy enabled, uses max(exact, alpha * ngram) for text columns.
-
-    Returns shape (n_template_cols, n_db_cols) matrix.
+    Returns (S, S_exact, S_ngram), each shape (n_template_cols, n_db_cols).
+    S[i, j] = max(exact, alpha * ngram) for text columns; S_ngram holds NaN
+    where no ngram containment was computed. Column arrays are loaded one at a
+    time and released — no cross-column cache, so peak memory is one column's
+    array instead of the whole table's.
     """
     n_tmpl = len(template.columns)
     n_db = len(db_columns)
 
     S = np.zeros((n_tmpl, n_db), dtype=np.float64)
-
-    # Cache loaded arrays
-    array_cache: Dict[str, np.ndarray] = {}
-    ngram_cache: Dict[str, np.ndarray] = {}
+    S_exact = np.zeros((n_tmpl, n_db), dtype=np.float64)
+    S_ngram = np.full((n_tmpl, n_db), np.nan, dtype=np.float64)
 
     for j, db_col in enumerate(db_columns):
-        # Load DB column hashes (memory-mapped)
-        if db_col.npy_path not in array_cache:
-            array_cache[db_col.npy_path] = store.load_hashes(db_col.npy_path)
-        db_hashes = array_cache[db_col.npy_path]
+        db_hashes = store.load_hashes(db_col.npy_path)
 
-        # Load ngram hashes if fuzzy enabled
         db_ngrams = None
         if fuzzy_enabled and db_col.dtype_group == "text" and db_col.ngrams_path:
-            if db_col.ngrams_path not in ngram_cache:
-                ngram_cache[db_col.ngrams_path] = store.load_ngrams(db_col.ngrams_path)
-            db_ngrams = ngram_cache[db_col.ngrams_path]
+            db_ngrams = store.load_ngrams(db_col.ngrams_path)
 
         for i, tmpl_col in enumerate(template.columns):
             if len(tmpl_col.distinct_hashes) == 0 or len(db_hashes) == 0:
-                S[i, j] = 0.0
-            else:
-                exact = np.isin(tmpl_col.distinct_hashes, db_hashes, assume_unique=True).mean()
-                S[i, j] = exact
+                continue
+            exact = float(np.isin(tmpl_col.distinct_hashes, db_hashes, assume_unique=True).mean())
+            S_exact[i, j] = exact
+            S[i, j] = exact
 
-                if db_ngrams is not None and len(tmpl_col.ngram_hashes) > 0:
-                    ng = _ngram_similarity(tmpl_col.ngram_hashes, db_ngrams, fuzzy_metric)
-                    S[i, j] = max(exact, fuzzy_alpha * ng)
+            if db_ngrams is not None and len(tmpl_col.ngram_hashes) > 0:
+                ng = _ngram_similarity(tmpl_col.ngram_hashes, db_ngrams, fuzzy_metric)
+                S_ngram[i, j] = ng
+                S[i, j] = max(exact, fuzzy_alpha * ng)
 
-    return S
-
-
-def _pair_containment(
-    tmpl_col,
-    db_col: ColumnRecord,
-    store: ArtifactStore,
-    fuzzy_enabled: bool,
-    array_cache: Dict[str, np.ndarray],
-    ngram_cache: Dict[str, np.ndarray],
-    fuzzy_metric: str = "jaccard",
-) -> Tuple[float, Optional[float]]:
-    """Return (exact_containment, ngram_containment) for one template/db pair."""
-    if db_col.npy_path not in array_cache:
-        array_cache[db_col.npy_path] = store.load_hashes(db_col.npy_path)
-    db_hashes = array_cache[db_col.npy_path]
-    if len(tmpl_col.distinct_hashes) == 0 or len(db_hashes) == 0:
-        exact = 0.0
-    else:
-        exact = float(np.isin(tmpl_col.distinct_hashes, db_hashes, assume_unique=True).mean())
-
-    ng = None
-    if (fuzzy_enabled and db_col.dtype_group == "text"
-            and db_col.ngrams_path and len(tmpl_col.ngram_hashes) > 0):
-        if db_col.ngrams_path not in ngram_cache:
-            ngram_cache[db_col.ngrams_path] = store.load_ngrams(db_col.ngrams_path)
-        db_ngrams = ngram_cache[db_col.ngrams_path]
-        ng = _ngram_similarity(tmpl_col.ngram_hashes, db_ngrams, fuzzy_metric)
-
-    return exact, ng
+    return S, S_exact, S_ngram
 
 
 def stage2_assignment(
@@ -301,8 +266,10 @@ def match_table(
     if not compatible:
         return None
 
-    # Stage 1: Containment matrix
-    S = stage1_containment(template, compatible, store, fuzzy_enabled, fuzzy_alpha, fuzzy_metric)
+    # Stage 1: Containment matrices
+    S, S_exact, S_ngram = stage1_containment(
+        template, compatible, store, fuzzy_enabled, fuzzy_alpha, fuzzy_metric
+    )
 
     # Stage 2: Assignment and score
     pairs, score, unmatched, details = stage2_assignment(S, compatible, min_containment)
@@ -310,18 +277,12 @@ def match_table(
     if not pairs:
         return None
 
-    # Build mapping with exact/ng containment
+    # Build mapping with exact/ng containment (read from matrices, no reloads)
     mapping = []
-    array_cache: Dict[str, np.ndarray] = {}
-    ngram_cache: Dict[str, np.ndarray] = {}
-
     for tmpl_idx, db_idx, _ in details:
         tmpl_col = template.columns[tmpl_idx]
         db_col = compatible[db_idx]
-
-        exact, ng = _pair_containment(
-            tmpl_col, db_col, store, fuzzy_enabled, array_cache, ngram_cache, fuzzy_metric
-        )
+        ng = None if np.isnan(S_ngram[tmpl_idx, db_idx]) else float(S_ngram[tmpl_idx, db_idx])
 
         mapping.append(
             ColumnMatch(
@@ -329,7 +290,7 @@ def match_table(
                 template_col_name=tmpl_col.name,
                 db_column=db_col.column_name,
                 containment=S[tmpl_idx, db_idx],
-                exact_containment=exact,
+                exact_containment=float(S_exact[tmpl_idx, db_idx]),
                 ngram_containment=ng,
                 nd=db_col.nd,
             )
@@ -340,9 +301,8 @@ def match_table(
     candidates = []
     for i, tmpl_col in enumerate(template.columns):
         for j, db_col in enumerate(compatible):
-            exact, ng = _pair_containment(
-                tmpl_col, db_col, store, fuzzy_enabled, array_cache, ngram_cache, fuzzy_metric
-            )
+            exact = float(S_exact[i, j])
+            ng = None if np.isnan(S_ngram[i, j]) else float(S_ngram[i, j])
             best = max(exact, ng if ng is not None else 0.0)
             if best >= candidate_min_containment:
                 candidates.append(

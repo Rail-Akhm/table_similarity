@@ -11,6 +11,7 @@ import base64
 import gzip
 import html
 import json
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -68,6 +69,48 @@ def _pack(payload) -> str:
     """gzip-compress + base64-encode a JSON payload for inlining in HTML."""
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.b64encode(gzip.compress(raw, 9)).decode("ascii")
+
+
+def _stream_pack(payload, fh) -> None:
+    """Stream payload as gzip+base64 into a text file handle (low memory).
+
+    Serializes rows one by one so the whole JSON/compressed/blob never lives in
+    RAM at once. Base64 output is emitted in 3-byte-aligned chunks.
+    """
+    sep = (",", ":")
+    head = (
+        b'{"meta":' + json.dumps(payload["meta"], ensure_ascii=False, separators=sep).encode("utf-8")
+        + b',"legend":' + json.dumps(payload["legend"], ensure_ascii=False, separators=sep).encode("utf-8")
+        + b',"cols":' + json.dumps(payload["cols"], ensure_ascii=False, separators=sep).encode("utf-8")
+        + b',"rows":['
+    )
+    tail = (
+        b'],"cfg":' + json.dumps(payload["cfg"], ensure_ascii=False, separators=sep).encode("utf-8")
+        + b'}'
+    )
+
+    comp = zlib.compressobj(9, zlib.DEFLATED, 31)  # gzip format
+    buf = b""
+
+    def push(data: bytes) -> None:
+        nonlocal buf
+        buf += comp.compress(data)
+        emit = len(buf) // 3 * 3
+        if emit:
+            fh.write(base64.b64encode(buf[:emit]).decode("ascii"))
+            buf = buf[emit:]
+
+    push(head)
+    first = True
+    for r in payload["rows"]:
+        if not first:
+            push(b",")
+        first = False
+        push(json.dumps(r, ensure_ascii=False, separators=sep).encode("utf-8"))
+    push(tail)
+    buf += comp.flush()
+    if buf:
+        fh.write(base64.b64encode(buf).decode("ascii"))
 
 
 # --------------------------------------------------------------------------- #
@@ -395,7 +438,7 @@ mark.fuzzy{background:var(--fuzzy-bg);color:var(--fuzzy-fg);border-radius:2px;pa
 """
 
 _COMPARE_JS = """
-const B64=__B64__;
+const B64="__B64__";
 const KIND_RU={exact:'точное',fuzzy:'нечёткое'};
 const MIN_COL=50, LS_PREFIX='tablefp:colw:';
 let P=null, ROWS=[], view=[];
@@ -600,7 +643,7 @@ function renderRow(i,row){
 window.addEventListener('DOMContentLoaded',init);
 """
 
-_COMPARE_TEMPLATE = """<!DOCTYPE html>
+_COMPARE_TEMPLATE_HEAD = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
@@ -642,7 +685,9 @@ _COMPARE_TEMPLATE = """<!DOCTYPE html>
     <div class="foot"><span>виртуальная прокрутка · gzip</span><span></span></div>
   </main>
 </div>
-<script>{js}</script>
+<script>"""
+
+_COMPARE_TEMPLATE_TAIL = """</script>
 </body>
 </html>"""
 
@@ -658,39 +703,27 @@ def _build_compare_payload(data: dict) -> dict:
     cols = []
     ci = 0
     cols.append({"k": "rownum", "l": "#", "w": 52, "s": True, "so": 0, "ci": -1, "mt": False})
-    for j, name in enumerate(source_columns):
+    # Template (НСИ) columns first — shown on the left, DB columns on the right.
+    for j, name in enumerate(target_columns):
         sticky = (j == 0)
         cols.append({
-            "k": "src", "l": name, "w": 180, "ci": ci,
-            "s": sticky, "so": (52 if sticky else 0),
-            "mt": name in src_matched,
-        })
-        ci += 1
-    cols.append({"k": "divider", "l": "", "w": 4, "s": False, "so": 0, "ci": -1, "mt": False})
-    for name in target_columns:
-        cols.append({
             "k": "tgt", "l": name, "w": 200, "ci": ci,
-            "s": False, "so": 0,
+            "s": sticky, "so": (52 if sticky else 0),
             "mt": name in tgt_matched,
         })
         ci += 1
-
-    def cell_payload(cell):
-        v = cell.get("value")
-        k = cell.get("kind", "none")
-        s = cell.get("spans") or []
-        out = {"v": v}
-        if k and k != "none":
-            out["k"] = k
-        if s:
-            out["s"] = [[int(a), int(b)] for a, b in s]
-        return out
+    cols.append({"k": "divider", "l": "", "w": 4, "s": False, "so": 0, "ci": -1, "mt": False})
+    for name in source_columns:
+        cols.append({
+            "k": "src", "l": name, "w": 180, "ci": ci,
+            "s": False, "so": 0,
+            "mt": name in src_matched,
+        })
+        ci += 1
 
     rows_payload = []
     for r in rows:
-        cells = [cell_payload(c) for c in r.get("source", [])]
-        cells += [cell_payload(c) for c in r.get("target", [])]
-        rows_payload.append({"m": bool(r.get("matched")), "c": cells})
+        rows_payload.append({"m": bool(r.get("m")), "c": list(r.get("c", []))})
 
     legend = [
         {
@@ -720,19 +753,26 @@ def _build_compare_payload(data: dict) -> dict:
 
 def generate_comparison_report(data: dict, output_path: str) -> None:
     """Render a side-by-side row comparison for one table to self-contained HTML."""
-    html_str = _render_comparison(data)
-    Path(output_path).write_text(html_str, encoding="utf-8")
+    payload = _build_compare_payload(data)
+    title = _escape(data.get("table", "сравнение"))
+    js_head, js_tail = _COMPARE_JS.split("__B64__", 1)
+    head = _COMPARE_TEMPLATE_HEAD.format(title=title, css=_COMPARE_CSS) + js_head
+    tail = js_tail + _COMPARE_TEMPLATE_TAIL
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        f.write(head)
+        _stream_pack(payload, f)
+        f.write(tail)
     n = len(data.get("rows", []))
-    matched = sum(1 for r in data.get("rows", []) if r.get("matched"))
+    matched = sum(1 for r in data.get("rows", []) if r.get("m"))
     print(f"Comparison: {output_path}  ({matched}/{n} rows matched)")
 
 
 def _render_comparison(data: dict) -> str:
     payload = _build_compare_payload(data)
     blob = _pack(payload)
-    js = _COMPARE_JS.replace("__B64__", json.dumps(blob))
     title = _escape(data.get("table", "сравнение"))
-    return _COMPARE_TEMPLATE.format(title=title, css=_COMPARE_CSS, js=js)
+    js = _COMPARE_JS.replace("__B64__", json.dumps(blob))
+    return _COMPARE_TEMPLATE_HEAD.format(title=title, css=_COMPARE_CSS) + js + _COMPARE_TEMPLATE_TAIL
 
 
 _COMPARE_INDEX_TEMPLATE = """<!DOCTYPE html>

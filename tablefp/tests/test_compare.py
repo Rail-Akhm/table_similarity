@@ -165,19 +165,17 @@ def test_build_comparison_source_driven_matched_mode():
     assert data["target_columns"] == ["Name"]
     assert len(data["rows"]) == 2  # driven by DB rows
 
-    # First DB row 'Alice' matches template row 'Alice'
+    # Cells: target first, then source (rows are payload-shaped {"m","c"})
     r0 = data["rows"][0]
-    assert r0["matched"] is True
-    assert r0["source"][0]["value"] == "Alice"
-    assert r0["source"][0]["kind"] == "exact"
-    assert r0["target"][0]["value"] == "Alice"
-    assert r0["target"][0]["kind"] == "exact"
+    assert r0["m"] is True
+    assert r0["c"][0] == {"v": "Alice", "k": "exact", "s": [[0, 5]]}   # target Name
+    assert r0["c"][1] == {"v": "Alice", "k": "exact", "s": [[0, 5]]}   # source name
 
     # Second DB row 'Carol' has no template match
     r1 = data["rows"][1]
-    assert r1["matched"] is False
-    assert r1["source"][0]["value"] == "Carol"
-    assert r1["target"][0]["value"] is None
+    assert r1["m"] is False
+    assert r1["c"][0]["v"] is None
+    assert r1["c"][1]["v"] == "Carol"
 
 
 def test_build_comparison_all_columns_mode():
@@ -191,16 +189,18 @@ def test_build_comparison_all_columns_mode():
     ]
     conn = _FakeConn(info_cols=["name", "age"], data_rows=data_rows)
 
-    data = build_comparison(conn, tmpl, [db_col], match, limit=500, columns_mode="all")
+    data = build_comparison(conn, tmpl, [db_col], match, limit=500,
+                            columns_mode="all", only_hit_columns=False)
 
     assert data["source_columns"] == ["name", "age"]
     r0 = data["rows"][0]
-    # name matched, age is an extra unmatched source column
-    assert r0["source"][0]["col"] == "name"
-    assert r0["source"][0]["kind"] == "exact"
-    assert r0["source"][1]["col"] == "age"
-    assert r0["source"][1]["value"] == "30"
-    assert r0["source"][1]["kind"] == "none"
+    # cells: target(Name), source(name), source(age)
+    assert r0["c"][0]["v"] == "Alice"   # Name exact
+    assert r0["c"][0]["k"] == "exact"
+    assert r0["c"][1]["v"] == "Alice"   # name exact
+    assert r0["c"][1]["k"] == "exact"
+    assert r0["c"][2]["v"] == "30"      # age unmatched
+    assert "k" not in r0["c"][2]
 
 
 def test_build_comparison_matched_mode_all_template_columns():
@@ -228,16 +228,17 @@ def test_build_comparison_matched_mode_all_template_columns():
 
     data = build_comparison(
         conn, tmpl, [db_col], match, limit=500,
-        columns_mode="matched", all_template_columns=True,
+        columns_mode="matched", all_template_columns=True, only_hit_columns=False,
     )
 
     assert data["source_columns"] == ["name"]
     assert data["target_columns"] == ["Name", "Comment"]
     r0 = data["rows"][0]
-    tgt_by_col = {c["col"]: c for c in r0["target"]}
-    assert tgt_by_col["Name"]["kind"] == "exact"
-    assert tgt_by_col["Comment"]["value"] == "hi"
-    assert tgt_by_col["Comment"]["kind"] == "none"
+    # cells: target(Name), target(Comment), source(name)
+    assert r0["c"][0] == {"v": "Alice", "k": "exact", "s": [[0, 5]]}
+    assert r0["c"][1]["v"] == "hi"     # Comment: no match kind
+    assert "k" not in r0["c"][1]
+    assert r0["c"][2]["v"] == "Alice"
 
 
 def test_build_comparison_uses_all_candidates():
@@ -275,9 +276,12 @@ def test_build_comparison_uses_all_candidates():
     # BOTH matched db columns are shown, not just the assigned 'name'
     assert set(data["source_columns"]) == {"name", "alt_name"}
     assert len(data["matched_pairs"]) == 2
-    src_by_col = {c["col"]: c for c in data["rows"][0]["source"]}
-    assert src_by_col["name"]["kind"] == "exact"
-    assert src_by_col["alt_name"]["kind"] == "exact"
+    row = data["rows"][0]
+    # cells: target(Name), source(name), source(alt_name)
+    assert row["c"][1]["v"] == "Alice"
+    assert row["c"][1]["k"] == "exact"
+    assert row["c"][2]["v"] == "Alice"
+    assert row["c"][2]["k"] == "exact"
 
 
 def test_dead_columns_with_zero_row_hits_are_filtered_out():
@@ -359,6 +363,39 @@ def test_matched_pairs_expose_exact_and_ngram_containment():
     assert legend["ngram"] == 0.95
 
 
+def test_only_hit_columns_filters_both_sides_in_all_mode():
+    # all mode + only_hit_columns: source drops no-hit extras ('age'), target
+    # drops template columns without a live pair ('Comment').
+    col = _tmpl_col("Name", ["Alice"], ["alice"], [111])
+    extra = _tmpl_col("Comment", ["hi"], ["hi"], [333])
+    tmpl = _Tmpl([col, extra])
+    db_col = ColumnRecord(
+        schema="s", table_name="t", column_name="name",
+        dtype_group="text", n=500, nd=500, npy_path="x",
+    )
+    match = TableMatch(
+        schema="s", table_name="t", score=0.9,
+        mapping=[ColumnMatch(
+            template_col_idx=0, template_col_name="Name", db_column="name",
+            containment=0.9, exact_containment=0.9, ngram_containment=None, nd=500,
+        )],
+    )
+
+    # __anchor, raw::name, raw::age, norm::name
+    data_rows = [("alice", "Alice", "30", "alice")]
+    conn = _FakeConn(info_cols=["name", "age"], data_rows=data_rows)
+
+    data = build_comparison(
+        conn, tmpl, [db_col], match, limit=500,
+        columns_mode="all", all_template_columns=True, only_hit_columns=True,
+    )
+
+    assert data["source_columns"] == ["name"]
+    assert data["target_columns"] == ["Name"]
+    r0 = data["rows"][0]
+    assert [c["v"] for c in r0["c"]] == ["Alice", "Alice"]
+
+
 def test_limit_none_omits_sql_limit_clause():
     # Default (unlimited) mode: the DB query must NOT contain a LIMIT clause.
     tmpl, db_col, match = _make_case()
@@ -422,10 +459,10 @@ def test_fuzzy_anchor_fallback_retains_fuzzy_only_rows():
     # Both rows retained: row1's id didn't match the template, but 'name' did.
     assert len(data["rows"]) == 2
     r1 = data["rows"][1]
-    assert r1["matched"] is True
-    by_col = {c["col"]: c for c in r1["source"]}
-    assert by_col["name"]["kind"] == "exact"
-    assert by_col["id"]["kind"] == "none"
+    assert r1["m"] is True
+    # cells: target(id), target(name), source(id), source(name)
+    assert "k" not in r1["c"][2]          # id: no match
+    assert r1["c"][3]["k"] == "exact"     # name: exact
 
 
 def test_exact_column_supports_row_level_fuzzy_matching():
@@ -462,14 +499,14 @@ def test_exact_column_supports_row_level_fuzzy_matching():
 
     # First row is exact
     r0 = data["rows"][0]
-    assert r0["matched"] is True
-    assert r0["source"][0]["value"] == "Абаканское"
-    assert r0["source"][0]["kind"] == "exact"
+    assert r0["m"] is True
+    assert r0["c"][1]["v"] == "Абаканское"  # source cell (after target)
+    assert r0["c"][1]["k"] == "exact"
 
     # Second row is fuzzy (even though the column overall is exact)
     r1 = data["rows"][1]
-    assert r1["matched"] is True
-    assert r1["source"][0]["value"] == "Аганское_ч"
-    assert r1["source"][0]["kind"] == "fuzzy"
-    assert len(r1["source"][0]["spans"]) > 0
+    assert r1["m"] is True
+    assert r1["c"][1]["v"] == "Аганское_ч"
+    assert r1["c"][1]["k"] == "fuzzy"
+    assert len(r1["c"][1]["s"]) > 0
 

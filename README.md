@@ -14,13 +14,13 @@ Supports **exact containment matching** (Phase 1) and **n-gram fuzzy matching**
 
 ```bash
 # Without pip install
-python run_tablefp.py index --config config/config.yaml
-python run_tablefp.py search fields.xlsx --config config/config.yaml --top 5
+python run_tablefp.py index --config config.yaml
+python run_tablefp.py search fields.xlsx --config config.yaml --top 5
 
 # Or install as package
 pip install -e .
-tablefp index --config config/config.yaml
-tablefp search fields.xlsx --config config/config.yaml --top 5
+tablefp index --config config.yaml
+tablefp search fields.xlsx --config config.yaml --top 5
 ```
 
 ## Commands
@@ -28,9 +28,9 @@ tablefp search fields.xlsx --config config/config.yaml --top 5
 ### `index` — Build column fingerprints
 
 ```bash
-tablefp index --config config/config.yaml          # index all configured tables
-tablefp index --config config/config.yaml --force  # re-index already indexed columns
-tablefp index --config config/config.yaml -v       # verbose (show every column)
+tablefp index --config config.yaml          # index all configured tables
+tablefp index --config config.yaml --force  # re-index already indexed columns
+tablefp index --config config.yaml -v       # verbose (show every column)
 ```
 
 For each column: computes stats (n, unique, min/max, quantiles, avg_len),
@@ -40,10 +40,10 @@ also builds n-gram hash union for eligible text columns → `.ngrams.npy`.
 ### `search` — Find matching tables
 
 ```bash
-tablefp search fields.xlsx --config config/config.yaml --top 5
-tablefp search fields.xlsx --config config/config.yaml --top 5 --out results.json
-tablefp search fields.xlsx --config config/config.yaml --no-verify  # skip row check
-tablefp search fields.xlsx --config config/config.yaml --fuzzy       # force fuzzy on
+tablefp search fields.xlsx --config config.yaml --top 5
+tablefp search fields.xlsx --config config.yaml --top 5 --out results.json
+tablefp search fields.xlsx --config config.yaml --no-verify  # skip row check
+tablefp search fields.xlsx --config config.yaml --fuzzy       # force fuzzy on
 ```
 
 | Option | Description |
@@ -93,10 +93,10 @@ search/filter. No dependencies.
 ### `compare` — Side-by-side row comparison
 
 ```bash
-tablefp compare fields.xlsx --config config/config.yaml --table dwh.orders -o compare.html
-tablefp compare fields.xlsx --config config/config.yaml --table dwh.orders --columns matched
-tablefp compare fields.xlsx --config config/config.yaml --table dwh.orders --limit 1000
-tablefp compare fields.xlsx --config config/config.yaml --table dwh.orders --no-verify
+tablefp compare fields.xlsx --config config.yaml --table dwh.orders -o compare.html
+tablefp compare fields.xlsx --config config.yaml --table dwh.orders --columns matched
+tablefp compare fields.xlsx --config config.yaml --table dwh.orders --limit 1000
+tablefp compare fields.xlsx --config config.yaml --table dwh.orders --no-verify
 ```
 
 Batch mode: `--top N` matches all indexed tables, sorts by score desc, and
@@ -104,11 +104,11 @@ writes one compare report per top-N table plus an `index.html` into the output
 directory:
 
 ```bash
-tablefp compare fields.xlsx --config config/config.yaml --top 10 -o compare_reports/
+tablefp compare fields.xlsx --config config.yaml --top 10 -o compare_reports/
 ```
 
-Produces a self-contained, source-driven HTML: the **source (DB) table rows are
-shown on the left**, and the **matching template row is shown on the right**,
+Produces a self-contained, source-driven HTML: the **matching template row is
+shown on the left**, and the **source (DB) table rows are shown on the right**,
 aligned via the best-matched *anchor* column. Matched cells are highlighted on
 both sides:
 
@@ -129,8 +129,26 @@ highlighted (e.g. a template column that matches both `mestorozhdenie` and
   in the header, unmatched columns are shown for context without highlighting.
 - `matched` — show only the matched columns (all of them, across candidates).
 
+`--only-hit-cols` hides every column (on both sides) that produced no cell-level
+match — useful when you only care about columns with actual data hits. Enabled
+by default; disable with `--no-only-hit-cols`. Works in both single-table
+(`--table`) and batch (`--top`) modes.
+
 Displayed text is the raw value as stored; matching/highlighting is computed on
 the normalized form. Requires live DB access (raw values are not indexed).
+
+### `run` — Search + search report + compare reports in one command
+
+```bash
+tablefp run fields.xlsx --config config.yaml --top 10 -o run_reports/
+```
+
+Runs the full flow: matches every indexed table against the template, writes
+`search.json` + `report.html`, then generates a compare report for each top-N
+table plus an `index.html` into the output directory. Accepts the same options
+as `search`/`compare` (`--limit`, `--columns`, `--only-matched`,
+`--only-hit-cols/--no-only-hit-cols`, `--all-template-cols`, `--fuzzy`, ...);
+row verification runs once, during the search stage.
 
 ## Configuration (`config.yaml`)
 

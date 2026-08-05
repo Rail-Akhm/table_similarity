@@ -1,6 +1,6 @@
 # Config with credentials — never commit
 config/
-
+config.yaml
 # Python
 __pycache__/
 *.pyc

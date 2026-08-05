@@ -40,11 +40,16 @@ def row_similarity(tmpl: str, db: str, n: int = 3) -> float:
     return len(A & B) / len(A)
 
 
-def build_ngram_hashes(values: List[str], n: int = 3) -> np.ndarray:
-    hashes: set = set()
+def add_ngram_hashes(values, target: set, n: int = 3) -> None:
+    """Add h64 of every n-gram of each value to `target` (stream-friendly)."""
     for v in values:
         for ng in ngrams(v, n):
-            hashes.add(h64(ng))
+            target.add(h64(ng))
+
+
+def build_ngram_hashes(values: List[str], n: int = 3) -> np.ndarray:
+    hashes: set = set()
+    add_ngram_hashes(values, hashes, n)
     return np.sort(np.array(list(hashes), dtype=np.int64))
 
 

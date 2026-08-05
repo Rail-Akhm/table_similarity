@@ -81,6 +81,7 @@ def build_comparison(
     extra_target_columns: Optional[list] = None,
     only_matched: bool = False,
     all_template_columns: bool = False,
+    only_hit_columns: bool = True,
 ) -> dict:
     """Produce a source-driven comparison structure for rendering.
 
@@ -307,15 +308,18 @@ def build_comparison(
                     pair["is_fuzzy"], ngram_size, verify_sim_threshold,
                 )
 
-        # source cells
+        # source cells (payload-shaped: v=value, k=kind, s=spans)
         src_cells = []
         for name in source_columns:
             raw = db_row[raw_idx[name]]
             raw = None if raw is None else str(raw)
             cls = pair_cls.get(name)
-            kind = cls["kind"] if cls else "none"
-            spans = cls["src_spans"] if cls else []
-            src_cells.append({"col": name, "value": raw, "kind": kind, "spans": spans})
+            cell = {"v": raw}
+            if cls and cls["kind"] != "none":
+                cell["k"] = cls["kind"]
+                if cls["src_spans"]:
+                    cell["s"] = [[int(a), int(b)] for a, b in cls["src_spans"]]
+            src_cells.append(cell)
 
         # target cells
         tgt_cells = []
@@ -332,34 +336,42 @@ def build_comparison(
                     if cls:
                         kind = cls["kind"]
                         spans = cls["tgt_spans"]
-            tgt_cells.append({"col": name, "value": t_raw, "kind": kind, "spans": spans})
+            cell = {"v": t_raw}
+            if kind != "none":
+                cell["k"] = kind
+                if spans:
+                    cell["s"] = [[int(a), int(b)] for a, b in spans]
+            tgt_cells.append(cell)
 
-        matched = tmpl_row_idx is not None and any(c["kind"] in ("exact", "fuzzy") for c in src_cells)
-        rows_out.append({"matched": matched, "source": src_cells, "target": tgt_cells})
+        matched = tmpl_row_idx is not None and any(c.get("k") in ("exact", "fuzzy") for c in src_cells)
+        rows_out.append({"m": matched, "c": tgt_cells + src_cells})
 
     # Drop matched pairs that produced ZERO row-level hits (e.g. a column with
     # 0.6% ngram column-level containment but no cell actually matching)
     live_src_cols = set()
     col_hits: Dict[str, int] = {}
+    n_tgt = len(target_columns)
     for r in rows_out:
-        for cell in r["source"]:
-            if cell["kind"] in ("exact", "fuzzy"):
-                live_src_cols.add(cell["col"])
-                col_hits[cell["col"]] = col_hits.get(cell["col"], 0) + 1
+        for cell, col in zip(r["c"][n_tgt:], source_columns):
+            if cell.get("k") in ("exact", "fuzzy"):
+                live_src_cols.add(col)
+                col_hits[col] = col_hits.get(col, 0) + 1
     n_rows_total = len(rows_out)
     if live_src_cols:
+        orig_src, orig_tgt = source_columns, target_columns
         matched_pairs = [p for p in matched_pairs if p["source_col"] in live_src_cols]
         db_to_pair = {k: v for k, v in db_to_pair.items() if v["source_col"] in live_src_cols}
-        if columns_mode == "matched":
+        if columns_mode == "matched" or only_hit_columns:
             source_columns = [c for c in source_columns if c in live_src_cols]
-            if not all_template_columns:
+            if not all_template_columns or only_hit_columns:
                 target_columns = list(dict.fromkeys(p["target_col"] for p in matched_pairs))
-        # Strip dead cells from each row so body matches the filtered headers
-        src_keep = set(source_columns)
-        tgt_keep = set(target_columns)
-        for r in rows_out:
-            r["source"] = [c for c in r["source"] if c["col"] in src_keep]
-            r["target"] = [c for c in r["target"] if c["col"] in tgt_keep]
+            # Strip dead cells from each row so body matches the filtered headers
+            src_keep = set(source_columns)
+            tgt_keep = set(target_columns)
+            for r in rows_out:
+                tgt = [c for c, col in zip(r["c"][:n_tgt], orig_tgt) if col in tgt_keep]
+                src = [c for c, col in zip(r["c"][n_tgt:], orig_src) if col in src_keep]
+                r["c"] = tgt + src
 
     public_pairs = [
         {k: p[k] for k in ("source_col", "target_col", "kind", "containment", "is_anchor",
@@ -381,5 +393,5 @@ def build_comparison(
         "target_columns": target_columns,
         "matched_pairs": public_pairs,
         "only_matched": only_matched,
-        "rows": [r for r in rows_out if r.get("matched")] if only_matched else rows_out,
+        "rows": [r for r in rows_out if r.get("m")] if only_matched else rows_out,
     }
