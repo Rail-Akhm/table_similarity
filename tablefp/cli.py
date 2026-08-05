@@ -68,7 +68,7 @@ def index(config: str, tables: tuple, force: bool, verbose: bool):
         force=force,
         fuzzy_config=cfg.fuzzy,
         dtype_groups=cfg.dtype_groups,
-        low_memory=cfg.low_memory,
+        max_memory_mb=cfg.max_memory_mb,
     )
 
 

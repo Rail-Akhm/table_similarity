@@ -24,7 +24,7 @@ class Config:
     min_template_distinct: int = 5
     store_type: str = "local"
     storage_dsn: str = ""
-    low_memory: bool = False
+    max_memory_mb: int = 0
     fuzzy: dict = field(default_factory=lambda: {
         "enabled": False,
         "ngram_size": 3,
@@ -65,7 +65,7 @@ class Config:
             min_template_distinct=data.get("min_template_distinct", 5),
             store_type=data.get("store_type", "local"),
             storage_dsn=data.get("storage_dsn", ""),
-            low_memory=data.get("low_memory", False),
+            max_memory_mb=data.get("max_memory_mb", 0),
             fuzzy=data.get("fuzzy", {
                 "enabled": False,
                 "ngram_size": 3,

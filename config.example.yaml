@@ -49,10 +49,14 @@ index_dir: "./fp_index"
 # Maximum concurrent DB connections during indexing
 max_workers: 4
 
-# Low-memory mode: streams data directly to disk via DB-side ORDER BY + batch
-# processing. Uses ~10× less RAM per column at the cost of ~20% slower indexing.
-# Set to true when indexing large tables with limited RAM.
-low_memory: false
+# Maximum RAM the indexer is allowed to use (in MB).  0 = unlimited (normal mode).
+# When > 0 the indexer switches to streaming mode (DB-side ORDER BY + direct-to-
+# disk .npy writes) and caps max_workers so concurrent columns never exceed the
+# budget.  Safe estimate: set to 70-80% of available RAM.
+#
+#   max_memory_mb: 1500   # for a 2 GB server
+#   max_memory_mb: 0      # unlimited — use configured max_workers, faster but riskier
+max_memory_mb: 0
 
 # Skip text columns with average normalized length > this value
 skip_text_avg_len: 500

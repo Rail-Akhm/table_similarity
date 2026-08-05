@@ -193,13 +193,13 @@ def index_column(
     skip_text_avg_len: int,
     force: bool = False,
     fuzzy_config: Optional[dict] = None,
-    low_memory: bool = False,
+    use_streaming: bool = False,
 ) -> Optional[ColumnRecord]:
     """Index a single column.
 
     Returns ColumnRecord on success, None if skipped.
 
-    When *low_memory* is True the function uses DB-side ``ORDER BY`` +
+    When *use_streaming* is True the function uses DB-side ``ORDER BY`` +
     direct-to-disk streaming for hashes and batch-processing for n-grams,
     keeping peak memory O(batch_size) instead of O(nd).
     """
@@ -294,9 +294,9 @@ def index_column(
     npy_path = ""
     ngrams_path = ""
 
-    if low_memory:
-        # ── low-memory path: DB-side ORDER BY + direct-to-disk streaming ──
-        logger.debug(f"Streaming distinct hashes (low-memory, ORDER BY in DB)...")
+    if use_streaming:
+        # ── streaming path: DB-side ORDER BY + direct-to-disk ──
+        logger.debug(f"Streaming distinct hashes (streaming mode, ORDER BY in DB)...")
         hashes_query = f"""
             SELECT DISTINCT {h64_expr}
             FROM {column.schema}.{column.table_name}
@@ -323,7 +323,7 @@ def index_column(
                 cur.execute(hashes_query)
                 _stream_sorted_hashes_to_npy(cur, nd, npy_path)
         except Exception as e:
-            raise RuntimeError(f"low-memory hash streaming failed: {e}") from e
+            raise RuntimeError(f"streaming hash write failed: {e}") from e
 
         # For DB store: mmap the temp .npy and save through the store
         if npy_tmp is not None:
@@ -338,7 +338,7 @@ def index_column(
                 except OSError:
                     pass
 
-        # N-gram hashes — batch-processed (low-memory)
+        # N-gram hashes — batch-processed (streaming mode)
         if column.dtype_group == "text" and fuzzy_config and fuzzy_config.get("enabled"):
             fc = fuzzy_config
             eligible = (nd <= fc.get("max_nd", 2_000_000))
@@ -474,9 +474,17 @@ def index_tables(
     force: bool = False,
     fuzzy_config: Optional[dict] = None,
     dtype_groups: Optional[List[str]] = None,
-    low_memory: bool = False,
+    max_memory_mb: int = 0,
 ):
-    """Index all configured tables."""
+    """Index all configured tables.
+
+    Parameters
+    ----------
+    max_memory_mb:
+        0 = unlimited — normal mode, uses configured *max_workers*.
+        >0 = streaming mode ON, *max_workers* capped so that concurrent
+        columns stay within the budget (rough estimate: 50 MB / worker).
+    """
     conn = get_connection(dsn)
     columns = crawl_columns(conn, tables, set(exclude_columns), exclude_column_patterns, dtype_groups)
     logger.info(f"Found {len(columns)} columns to index")
@@ -486,18 +494,26 @@ def index_tables(
         conn.close()
         return
 
-    # Low-memory mode: single worker avoids concurrent allocations
-    if low_memory:
-        if max_workers > 1:
+    # Decide streaming mode + worker cap from memory budget
+    if max_memory_mb > 0:
+        use_streaming = True
+        # Conservative estimate: each concurrent column needs ~50 MB for
+        # batch buffers + connection overhead in streaming mode.
+        mem_workers = max(1, max_memory_mb // 50)
+        if max_workers > mem_workers:
             logger.info(
-                f"Low-memory mode: limiting workers from {max_workers} to 1 "
-                f"(set low_memory: false to restore parallelism)"
+                f"Memory budget {max_memory_mb} MB → capping workers from "
+                f"{max_workers} to {mem_workers} (~50 MB each)"
             )
-        max_workers = 1
-        logger.info(
-            f"Low-memory mode enabled: DB-side ORDER BY + disk streaming, "
-            f"batched n-gram processing"
-        )
+            max_workers = mem_workers
+        else:
+            logger.info(
+                f"Memory budget {max_memory_mb} MB → streaming mode ON, "
+                f"{max_workers} worker(s)"
+            )
+    else:
+        use_streaming = False
+        logger.debug("max_memory_mb=0 → normal mode (no memory cap)")
 
     # Index in parallel
     failed = []
@@ -528,7 +544,7 @@ def index_tables(
                 skip_text_avg_len,
                 force,
                 fuzzy_config,
-                low_memory=low_memory,
+                use_streaming=use_streaming,
             )
         finally:
             worker_conn.close()
