@@ -3,8 +3,8 @@
 
 Usage:
     python run_tablefp.py --help
-    python run_tablefp.py index --config config.yaml
-    python run_tablefp.py search template.xlsx --config config.yaml
+    python run_tablefp.py index --config config/config.yaml
+    python run_tablefp.py search fields.xlsx --config config/config.yaml
 """
 
 import sys
