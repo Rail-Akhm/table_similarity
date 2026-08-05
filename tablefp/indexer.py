@@ -503,6 +503,20 @@ def index_tables(
     failed = []
     completed = 0
 
+    # Pre-compute table grouping for progress display
+    _table_order: List[tuple] = list(dict.fromkeys(
+        (c.schema, c.table_name) for c in columns
+    ))
+    _col_per_table: dict = {}
+    for c in columns:
+        key = (c.schema, c.table_name)
+        _col_per_table[key] = _col_per_table.get(key, 0) + 1
+    total_tables = len(_table_order)
+
+    # Track table completion: table is "done" when all its columns are done
+    _table_done: set = set()
+    _table_col_done: dict = {}
+
     def worker(column: ColumnInfo):
         """Worker function that creates its own connection."""
         worker_conn = get_connection(dsn)
@@ -523,7 +537,16 @@ def index_tables(
         futures = {executor.submit(worker, col): col for col in columns}
 
         with logging_redirect_tqdm():
-            pbar = tqdm(total=len(columns), desc="Indexing", unit="col", dynamic_ncols=True)
+            pbar = tqdm(
+                total=len(columns),
+                desc="Tables 0/0",
+                unit="col",
+                dynamic_ncols=True,
+                bar_format=(
+                    "{desc:>24s}  {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                    "[{elapsed}<{remaining}, {rate_fmt}{postfix}]"
+                ),
+            )
             for future in as_completed(futures):
                 col = futures[future]
                 try:
@@ -534,7 +557,19 @@ def index_tables(
                 except Exception as e:
                     logger.error(f"FAIL  {col.schema}.{col.table_name}.{col.column_name}: {e}")
                     failed.append(col)
-                pbar.set_postfix_str(f"{col.table_name}.{col.column_name}", refresh=False)
+
+                # Update table-level progress
+                key = (col.schema, col.table_name)
+                _table_col_done[key] = _table_col_done.get(key, 0) + 1
+                if _table_col_done[key] >= _col_per_table.get(key, 0):
+                    _table_done.add(key)
+
+                tables_done = len(_table_done)
+                pbar.set_description(f"Tables {tables_done}/{total_tables}")
+                pbar.set_postfix_str(
+                    f"{col.schema}.{col.table_name}.{col.column_name}",
+                    refresh=False,
+                )
                 pbar.update(1)
             pbar.close()
 
