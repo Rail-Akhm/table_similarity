@@ -494,23 +494,13 @@ def index_tables(
         conn.close()
         return
 
-    # Decide streaming mode + worker cap from memory budget
+    # Decide streaming mode from memory budget
     if max_memory_mb > 0:
         use_streaming = True
-        # Conservative estimate: each concurrent column needs ~50 MB for
-        # batch buffers + connection overhead in streaming mode.
-        mem_workers = max(1, max_memory_mb // 50)
-        if max_workers > mem_workers:
-            logger.info(
-                f"Memory budget {max_memory_mb} MB → capping workers from "
-                f"{max_workers} to {mem_workers} (~50 MB each)"
-            )
-            max_workers = mem_workers
-        else:
-            logger.info(
-                f"Memory budget {max_memory_mb} MB → streaming mode ON, "
-                f"{max_workers} worker(s)"
-            )
+        logger.info(
+            f"Memory budget {max_memory_mb} MB → streaming mode ON "
+            f"(DB-side ORDER BY + direct-to-disk, {max_workers} worker(s))"
+        )
     else:
         use_streaming = False
         logger.debug("max_memory_mb=0 → normal mode (no memory cap)")

@@ -49,13 +49,13 @@ index_dir: "./fp_index"
 # Maximum concurrent DB connections during indexing
 max_workers: 4
 
-# Maximum RAM the indexer is allowed to use (in MB).  0 = unlimited (normal mode).
-# When > 0 the indexer switches to streaming mode (DB-side ORDER BY + direct-to-
-# disk .npy writes) and caps max_workers so concurrent columns never exceed the
-# budget.  Safe estimate: set to 70-80% of available RAM.
+# When > 0 the indexer switches to streaming mode: DB-side ORDER BY + direct-to-
+# disk .npy writes.  A single large column then peaks at ~20 MB instead of 200+ MB.
+# Set to ~75% of available RAM (e.g. 1500 for a 2 GB server).
+# Workers are still controlled by max_workers — set that to your DB connection limit.
 #
-#   max_memory_mb: 1500   # for a 2 GB server
-#   max_memory_mb: 0      # unlimited — use configured max_workers, faster but riskier
+#   max_memory_mb: 1500   # streaming mode, protects against OOM on large columns
+#   max_memory_mb: 0      # normal mode — faster for small columns, riskier for large
 max_memory_mb: 0
 
 # Skip text columns with average normalized length > this value
